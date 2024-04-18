@@ -408,7 +408,7 @@ int main() {
 
     ConnMgr mgr(pipe_fds[1]);
     try {
-        asyncio::run(asyncio::gather(client(&mgr, "localhost", 8888),
+        asyncio::run(asyncio::gather(//client(&mgr, "localhost", 8888),
                                      client(&mgr, "c3.c3-soft.com", 8333),
                                      client(&mgr, "c3.c3-soft.com", 48333),
                                      SigCatcher(&mgr)));
