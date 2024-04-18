@@ -1,0 +1,9 @@
+# This will set the initial value for the C/CXX flags.
+# We need to do this to disable -DNDEBUG
+set(CMAKE_C_FLAGS_MINSIZEREL_INIT "-Os")
+set(CMAKE_C_FLAGS_RELEASE_INIT "-O3")
+set(CMAKE_C_FLAGS_RELWITHDEBINFO_INIT "-g -O2")
+
+set(CMAKE_CXX_FLAGS_MINSIZEREL_INIT "-Os")
+set(CMAKE_CXX_FLAGS_RELEASE_INIT "-O3")
+set(CMAKE_CXX_FLAGS_RELWITHDEBINFO_INIT "-g -O2")

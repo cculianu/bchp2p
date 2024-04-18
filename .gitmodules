@@ -1,0 +1,6 @@
+[submodule "asyncio"]
+	path = asyncio
+	url = https://github.com/cculianu/asyncio
+[submodule "univalue"]
+	path = univalue
+	url = https://github.com/cculianu/UniValue
