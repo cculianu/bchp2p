@@ -21,10 +21,6 @@ find_package(fmt REQUIRED)
 # asio
 find_package(asio REQUIRED)
 
-# AsyncIO
-add_subdirectory(asyncio)
-target_compile_options(asyncio PRIVATE -Wall -Wno-unused-parameter)
-
 # UniValue
 set(BUILD_BENCH OFF CACHE INTERNAL "Used by UniValue, disabled" FORCE)
 set(BUILD_TESTS OFF CACHE INTERNAL "Used by UniValue, disabled" FORCE)
@@ -52,23 +48,18 @@ endif()
 target_link_libraries(bitcoin fmt::fmt)
 # /BCHN
 
-# bchp2p using that tiny asyncio lib
-add_executable(bchp2p_asyncio bchp2p_asyncio.cpp)
-target_compile_options(bchp2p_asyncio PRIVATE -Wall -Wno-unused-parameter)
-target_link_libraries(bchp2p_asyncio fmt::fmt asyncio univalue bitcoin)
-
 # Testing echoserver using asio
 add_executable(asiotest asiotest.cpp util.cpp)
 target_compile_options(asiotest PRIVATE -Wall -Wno-unused-parameter)
 target_link_libraries(asiotest fmt::fmt asio::asio univalue bitcoin)
 
 # bchp2p using asio
-add_executable(bchp2p_asio bchp2p_asio.cpp util.cpp)
-target_compile_options(bchp2p_asio PRIVATE -Wall -Wno-unused-parameter)
-target_link_libraries(bchp2p_asio fmt::fmt asio::asio univalue bitcoin)
+add_executable(bchp2p bchp2p.cpp util.cpp)
+target_compile_options(bchp2p PRIVATE -Wall -Wno-unused-parameter)
+target_link_libraries(bchp2p fmt::fmt asio::asio univalue bitcoin)
 
 #include(GNUInstallDirs)
-#install(TARGETS bchp2p_asio bchp2p_asyncio
+#install(TARGETS bchp2p
 #    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
 #    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
 #)
