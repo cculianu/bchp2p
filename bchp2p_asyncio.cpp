@@ -8,6 +8,7 @@
 
 #include <asyncio/finally.h>
 #include <asyncio/gather.h>
+#include <asyncio/noncopyable.h>
 #include <asyncio/open_connection.h>
 #include <asyncio/runner.h>
 #include <asyncio/sleep.h>
@@ -60,7 +61,7 @@ struct ConnMgr {
     }
 };
 
-class Connection
+class Connection : NonCopyable
 {
     ConnMgr * const mgr;
     asyncio::Stream sock;
@@ -76,24 +77,33 @@ class Connection
 
     int protoVersion = bitcoin::INIT_PROTO_VERSION;
     std::string cleanSubVer;
-    bool sentVersion = false, sentVerAck = false, gotVersion = false;
+    bool sentVersion = false, sentVerAck = false, gotVersion = false, gotVerAck = false, didAfterHandshake = false;
     bool relay = false;
     int misbehavior = 0;
     static constexpr int MAX_MISBEHAVIOR = 100;
 
+    [[nodiscard]]
     Task<> MsgHandler(bitcoin::CSerializedNetMsg msg);
 
-    Task<> SendVersion();
-    Task<> SendVerACK(int nVersion = 0);
-    Task<> Send(bitcoin::CSerializedNetMsg msg);
+    [[nodiscard]] Task<> SendVersion();
+    [[nodiscard]] Task<> SendVerACK(int nVersion = 0);
+    [[nodiscard]] Task<> Send(bitcoin::CSerializedNetMsg msg);
     template <typename ...Args>
-    Task<> Send(std::string_view msg_type, Args ...args) {
+    [[nodiscard]] Task<> Send(std::string_view msg_type, Args ...args) {
         using namespace bitcoin;
         co_await Send(CNetMsgMaker(protoVersion).Make(msg_type, std::forward<Args>(args)...));
     }
 
-    Task<> HandleVersion(bitcoin::CSerializedNetMsg msg);
-    Task<> HandlePing(bitcoin::CSerializedNetMsg msg);
+    [[nodiscard]] Task<> HandleVersion(bitcoin::CSerializedNetMsg msg);
+    [[nodiscard]] Task<> HandlePing(bitcoin::CSerializedNetMsg msg);
+    [[nodiscard]] Task<> HandlePong(bitcoin::CSerializedNetMsg msg);
+
+    [[nodiscard]] Task<> DoOnceIfAfterHandshake(); // does GETADDR, etc -- stuff we do immediately after a state change to "fully established"
+
+    static constexpr int pingIntervalSecs = 30;
+    uint64_t lastPingNonceSent = 0;
+    int64_t lastPingTSMillis = 0, lastPongTSMillis = 0, lastPingPongDelta = 0;
+    [[nodiscard]] Task<> Pinger(); // periodically pings node every 60 seconds
 
     std::string GetInfoStr() const {
         const int64_t nTimeMicros = bitcoin::GetTimeMicros();
@@ -106,7 +116,7 @@ class Connection
     void Misbehaving(int score, std::string_view msg);
 
     using ST = ScheduledTask<Task<>>;
-    std::unique_ptr<ST> disconnector;
+    std::unique_ptr<ST> disconnector, pinger;
 
 public:
     Connection(ConnMgr *mgr, asyncio::Stream &&s_, bool inbound_, const bitcoin::CMessageHeader::MessageMagic &magic_)
@@ -115,20 +125,26 @@ public:
         mgr->add(this);
         bitcoin::CService srv;
         std::visit([&](const auto &s){ srv = bitcoin::CService(s); }, sock.get_sockaddr(false));
-        local = bitcoin::CAddress(srv, bitcoin::ServiceFlags(bitcoin::NODE_BITCOIN_CASH|bitcoin::NODE_NETWORK), bitcoin::GetTime());
+        local = bitcoin::CAddress(srv, bitcoin::ServiceFlags(bitcoin::NODE_BITCOIN_CASH|bitcoin::NODE_NETWORK|bitcoin::NODE_BLOOM),
+                                  bitcoin::GetTime());
         std::visit([&](const auto &s){ srv = bitcoin::CService(s); }, sock.get_sockaddr(true));
         remote = bitcoin::CAddress(srv, bitcoin::ServiceFlags::NODE_NONE, bitcoin::GetTime());
     }
 
+    Connection(Connection &&) = delete;
+
     ~Connection() { mgr->rm(this); }
 
+    [[nodiscard]]
     Task<> ProcessLoop();
 
+    [[nodiscard]]
     Task<> CancelProcessing() {
         fmt::print("{}: Canceling processing ...\n", GetInfoStr());
         disconnectRequested = true;
         fmt::print("{}: shutdown ...\n", GetInfoStr());
         sock.shutdown();
+        pinger.reset();
         co_await sleep(std::chrono::milliseconds{10});
         fmt::print("{}: close ...\n", GetInfoStr());
         sock.close();
@@ -140,6 +156,10 @@ public:
             disconnector = std::make_unique<ST>(schedule_task(CancelProcessing()));
         }
     }
+
+    void schedulePinger() { pinger = std::make_unique<ST>(schedule_task(Pinger())); }
+
+    bool isFullyConnected() const { return sentVersion && sentVerAck && gotVersion && gotVerAck; }
 };
 
 Task<> Connection::SendVersion()
@@ -205,6 +225,7 @@ Task<> Connection::ProcessLoop()
         while ( ! disconnectRequested) {
             auto data = co_await sock.read<std::string>(Hdr::HEADER_SIZE, true);
             if (data.empty()) {
+                fmt::print("{}: EOF\n", GetInfoStr());
                 break;
             }
             if (data.size() != Hdr::HEADER_SIZE) throw ProtocolError("Short header read");
@@ -226,8 +247,7 @@ Task<> Connection::ProcessLoop()
 void Connection::Misbehaving(int howmuch, std::string_view msg)
 {
     misbehavior += howmuch;
-    fmt::print("{}: {}: ({} -> {}) reason: {}\n",
-               GetInfoStr(), __func__,  misbehavior - howmuch, howmuch, msg);
+    fmt::print("{}: {}: ({} -> {}) reason: {}\n", GetInfoStr(), __func__,  misbehavior - howmuch, misbehavior, msg);
     if (misbehavior >= MAX_MISBEHAVIOR) {
         scheduleDisconnect();
     }
@@ -262,6 +282,15 @@ Task<> Connection::MsgHandler(bitcoin::CSerializedNetMsg msg)
 
     if (ncmd == NetMsgType::PING) {
         co_return co_await HandlePing(std::move(msg));
+    }
+
+    if (ncmd == NetMsgType::PONG) {
+        co_return co_await HandlePong(std::move(msg));
+    }
+
+    if (ncmd == NetMsgType::VERACK) {
+        gotVerAck = true;
+        co_return co_await DoOnceIfAfterHandshake();
     }
 }
 
@@ -328,7 +357,29 @@ Task<> Connection::HandleVersion(bitcoin::CSerializedNetMsg msg)
     }
 
     co_await SendVerACK(/*nVersion*/);
-    co_await Send(NetMsgType::GETADDR);
+    co_await DoOnceIfAfterHandshake();
+}
+
+Task<> Connection::DoOnceIfAfterHandshake() {
+    using namespace bitcoin;
+    if (!didAfterHandshake && isFullyConnected()) {
+        didAfterHandshake = true;
+        co_await Send(NetMsgType::GETADDR);
+        if (protoVersion >= SENDHEADERS_VERSION) {
+            // Tell our peer we prefer to receive headers rather than inv's
+            // We send this to non-NODE NETWORK peers as well, because even
+            // non-NODE NETWORK peers can announce blocks (such as pruning
+            // nodes)
+            co_await Send(NetMsgType::SENDHEADERS);
+        }
+        if (protoVersion >= SHORT_IDS_BLOCKS_VERSION) {
+            bool const fAnnounceUsingCMPCTBLOCK = false;
+            uint64_t const nCMPCTBLOCKVersion = 1;
+            co_await Send(NetMsgType::SENDCMPCT, fAnnounceUsingCMPCTBLOCK, nCMPCTBLOCKVersion); // testing!
+        }
+        co_await Send(NetMsgType::MEMPOOL); // testing!
+        schedulePinger();
+    }
 }
 
 Task<> Connection::HandlePing(bitcoin::CSerializedNetMsg msg)
@@ -352,6 +403,61 @@ Task<> Connection::HandlePing(bitcoin::CSerializedNetMsg msg)
         // second and this node takes 5 seconds to respond to each, the 5th
         // ping the remote sends would appear to return very quickly.
         co_await Send(NetMsgType::PONG, nonce);
+    }
+}
+
+Task<> Connection::HandlePong(bitcoin::CSerializedNetMsg msg)
+{
+    using namespace bitcoin;
+    std::string problem;
+    bool reject = false;
+    if (!lastPingNonceSent) {
+        // spurious PONG!
+        problem = "spurious-pong-msg";
+        reject = true;
+    } else {
+        VectorReader vr(SER_NETWORK, protoVersion, msg.data, 0);
+        uint64_t nonce;
+        if (vr.size() >= sizeof(nonce)) {
+            vr >> nonce;
+            if (nonce == lastPingNonceSent) {
+                lastPongTSMillis = GetTimeMillis();
+                lastPingPongDelta = lastPongTSMillis - lastPingTSMillis; // TODO: reject negative or 0 values here?
+                fmt::print("{}: Valid ping reply, measured latency: {:1.3f} msec\n", GetInfoStr(), lastPingPongDelta / 1e3);
+            } else {
+                problem = fmt::format("Ping reply nonce ({:x}) != what we expected ({:x})", nonce, lastPingNonceSent);
+            }
+            lastPingNonceSent = 0;
+        } else {
+            problem = "short-payload";
+            reject = true;
+        }
+    }
+
+    if (!problem.empty()) {
+        Misbehaving(1, problem);
+        if (reject) co_await Send(NetMsgType::REJECT, NetMsgType::PONG, REJECT_INVALID, problem);
+    }
+}
+
+Task<> Connection::Pinger()
+{
+    using namespace bitcoin;
+    fmt::print("{}: Pinger started\n", GetInfoStr());
+    finally { fmt::print("{}: Pinger stopped\n", GetInfoStr()); };
+
+    while (!disconnectRequested) {
+        // sleep 5 secs if not yet fully connected or 30 otherwise
+        co_await asyncio::sleep(std::chrono::seconds{isFullyConnected() ? pingIntervalSecs : 5});
+        fmt::print("{}: Pinger wakeup ..\n", GetInfoStr());
+        if (isFullyConnected()) {
+            if (lastPingTSMillis && /* test for neg. below 1 sec: */ lastPongTSMillis - lastPingTSMillis < -1'000'000) {
+                Misbehaving(10, "No recent ping reply");
+            }
+            do { lastPingNonceSent = GetRand64(); } while (!lastPingNonceSent);
+            lastPingTSMillis = GetTimeMillis();
+            co_await Send(NetMsgType::PING, lastPingNonceSent);
+        }
     }
 }
 
