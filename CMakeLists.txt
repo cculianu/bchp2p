@@ -33,7 +33,7 @@ target_compile_options(univalue PRIVATE -Wall -Wno-unused-parameter)
 
 # BCHN modified sources, as a lib
 add_library(bitcoin
-    bitcoin/amount.cpp bitcoin/base58.cpp bitcoin/block.cpp bitcoin/cashaddr.cpp bitcoin/cashaddrenc.cpp
+    bitcoin/amount.cpp bitcoin/base58.cpp bitcoin/block.cpp bitcoin/bloom.cpp bitcoin/cashaddr.cpp bitcoin/cashaddrenc.cpp
     bitcoin/crypto/aes.cpp bitcoin/crypto/chacha20.cpp bitcoin/crypto/hmac_sha256.cpp bitcoin/crypto/hmac_sha512.cpp
     bitcoin/crypto/ripemd160.cpp bitcoin/crypto/sha1.cpp bitcoin/crypto/sha256.cpp bitcoin/crypto/sha256_sse4.cpp
     bitcoin/crypto/sha3.cpp bitcoin/crypto/sha512.cpp bitcoin/crypto/siphash.cpp bitcoin/hash.cpp
