@@ -558,4 +558,7 @@ static constexpr size_t MAX_ADDR_TO_SEND = 1000;
  */
 static constexpr unsigned int MAX_HEADERS_RESULTS = 2000;
 
+/** Maximum length of reject messages. From validation.h */
+static constexpr unsigned int MAX_REJECT_MESSAGE_LENGTH = 111;
+
 } // namespace bitcoin

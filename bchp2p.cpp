@@ -161,7 +161,7 @@ class Connection
     std::map<uint256, int64_t> requestedInvs;
 
     [[nodiscard]]
-    async<> MsgHandler(bitcoin::CSerializedNetMsg msg);
+    async<> MsgHandler(bitcoin::CSerializedNetMsg && msg);
 
     [[nodiscard]] async<> SendVersion();
     [[nodiscard]] async<> SendVerACK(int nVersion = 0);
@@ -177,14 +177,15 @@ class Connection
         return VectorReader(SER_NETWORK, protoVersion | protoFlags, msg.data, pos);
     }
 
-    [[nodiscard]] async<> HandleVersion(bitcoin::CSerializedNetMsg msg);
-    [[nodiscard]] async<> HandlePing(bitcoin::CSerializedNetMsg msg);
-    [[nodiscard]] async<> HandlePong(bitcoin::CSerializedNetMsg msg);
-    [[nodiscard]] async<> HandleInvs(bitcoin::CSerializedNetMsg msg);
-    [[nodiscard]] async<> HandleTx(bitcoin::CSerializedNetMsg msg);
-    [[nodiscard]] async<> HandleFeeFilter(bitcoin::CSerializedNetMsg msg);
-    [[nodiscard]] async<> HandleAddr(bitcoin::CSerializedNetMsg msg);
-    [[nodiscard]] async<> HandleHeaders(bitcoin::CSerializedNetMsg msg);
+    [[nodiscard]] async<> HandleVersion(bitcoin::CSerializedNetMsg && msg);
+    [[nodiscard]] async<> HandlePing(bitcoin::CSerializedNetMsg && msg);
+    [[nodiscard]] async<> HandlePong(bitcoin::CSerializedNetMsg && msg);
+    [[nodiscard]] async<> HandleInvs(bitcoin::CSerializedNetMsg && msg);
+    [[nodiscard]] async<> HandleTx(bitcoin::CSerializedNetMsg && msg);
+    [[nodiscard]] async<> HandleFeeFilter(bitcoin::CSerializedNetMsg && msg);
+    [[nodiscard]] async<> HandleAddr(bitcoin::CSerializedNetMsg && msg);
+    [[nodiscard]] async<> HandleHeaders(bitcoin::CSerializedNetMsg && msg);
+    [[nodiscard]] async<> HandleReject(bitcoin::CSerializedNetMsg && msg);
 
     [[nodiscard]] async<> DoOnceIfAfterHandshake(); // does GETADDR, etc -- stuff we do immediately after a state change to "fully established"
 
@@ -408,7 +409,7 @@ void Connection::Misbehaving(int howmuch, std::string_view msg)
     }
 }
 
-async<> Connection::MsgHandler(bitcoin::CSerializedNetMsg msg)
+async<> Connection::MsgHandler(bitcoin::CSerializedNetMsg && msg)
 {
     using namespace bitcoin;
     Tic t0;
@@ -467,9 +468,13 @@ async<> Connection::MsgHandler(bitcoin::CSerializedNetMsg msg)
     if (ncmd == NetMsgType::HEADERS) {
         co_return co_await HandleHeaders(std::move(msg));
     }
+
+    if (ncmd == NetMsgType::REJECT) {
+        co_return co_await HandleReject(std::move(msg));
+    }
 }
 
-async<> Connection::HandleVersion(bitcoin::CSerializedNetMsg msg)
+async<> Connection::HandleVersion(bitcoin::CSerializedNetMsg && msg)
 {
     using namespace bitcoin;
     if (gotVersion) {
@@ -561,7 +566,7 @@ async<> Connection::DoOnceIfAfterHandshake() {
     }
 }
 
-async<> Connection::HandlePing(bitcoin::CSerializedNetMsg msg)
+async<> Connection::HandlePing(bitcoin::CSerializedNetMsg && msg)
 {
     using namespace bitcoin;
     if (protoVersion > BIP0031_VERSION) {
@@ -585,7 +590,7 @@ async<> Connection::HandlePing(bitcoin::CSerializedNetMsg msg)
     }
 }
 
-async<> Connection::HandlePong(bitcoin::CSerializedNetMsg msg)
+async<> Connection::HandlePong(bitcoin::CSerializedNetMsg && msg)
 {
     using namespace bitcoin;
     std::string problem;
@@ -620,7 +625,7 @@ async<> Connection::HandlePong(bitcoin::CSerializedNetMsg msg)
     }
 }
 
-async<> Connection::HandleInvs(bitcoin::CSerializedNetMsg msg)
+async<> Connection::HandleInvs(bitcoin::CSerializedNetMsg && msg)
 {
     using namespace bitcoin;
     bool const notfound = msg.m_type == NetMsgType::NOTFOUND;
@@ -675,7 +680,7 @@ async<> Connection::HandleInvs(bitcoin::CSerializedNetMsg msg)
     }
 }
 
-async<> Connection::HandleTx(bitcoin::CSerializedNetMsg msg)
+async<> Connection::HandleTx(bitcoin::CSerializedNetMsg && msg)
 {
     using namespace bitcoin;
     CTransactionRef tx;
@@ -695,7 +700,7 @@ async<> Connection::HandleTx(bitcoin::CSerializedNetMsg msg)
           tx->vin.size(), tx->vout.size());
 }
 
-async<> Connection::HandleFeeFilter(bitcoin::CSerializedNetMsg msg)
+async<> Connection::HandleFeeFilter(bitcoin::CSerializedNetMsg && msg)
 {
     using namespace bitcoin;
     Amount newFeeFilter;
@@ -712,7 +717,7 @@ async<> Connection::HandleFeeFilter(bitcoin::CSerializedNetMsg msg)
     }
 }
 
-async<> Connection::HandleAddr(bitcoin::CSerializedNetMsg msg)
+async<> Connection::HandleAddr(bitcoin::CSerializedNetMsg && msg)
 {
     using namespace bitcoin;
     std::vector<CAddress> vAddr;
@@ -736,7 +741,7 @@ async<> Connection::HandleAddr(bitcoin::CSerializedNetMsg msg)
     Log("{}: Got {}/{} new addresses", GetInfoStr(), newAddrs.size(), vAddr.size());
 }
 
-async<> Connection::HandleHeaders(bitcoin::CSerializedNetMsg msg)
+async<> Connection::HandleHeaders(bitcoin::CSerializedNetMsg && msg)
 {
     using namespace bitcoin;
     auto vr = MakeReader(msg);
@@ -755,6 +760,31 @@ async<> Connection::HandleHeaders(bitcoin::CSerializedNetMsg msg)
             Log("{}: Checkpoint at height {} verified", GetInfoStr(), GetCheckpointHeight());
         }
     }
+}
+
+async<> Connection::HandleReject(bitcoin::CSerializedNetMsg && msg)
+{
+    using namespace bitcoin;
+    try {
+        std::string strMsg;
+        uint8_t ccode;
+        std::string strReason;
+        auto vr = MakeReader(msg);
+        vr >> LIMITED_STRING(strMsg, CMessageHeader::COMMAND_SIZE) >> ccode
+           >> LIMITED_STRING(strReason, MAX_REJECT_MESSAGE_LENGTH);
+
+        auto msg = fmt::format("{} code {}: {}", strMsg, ccode, strReason);
+        if (strMsg == NetMsgType::BLOCK || strMsg == NetMsgType::TX) {
+            uint256 hash;
+            vr >> hash;
+            msg += fmt::format(": hash {}", hash.ToString());
+        }
+        Warning("{}: Reject {}", GetInfoStr(), SanitizeString(msg));
+    } catch (const std::ios_base::failure &) {
+        // Avoid feedback loops by preventing reject messages from triggering a new reject message.
+        Warning("{}: Unparseable reject message received", GetInfoStr());
+    }
+    co_return;
 }
 
 async<> Connection::Pinger()
