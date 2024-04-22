@@ -32,7 +32,7 @@ add_library(bitcoin
     bitcoin/amount.cpp bitcoin/base58.cpp bitcoin/block.cpp bitcoin/bloom.cpp bitcoin/cashaddr.cpp bitcoin/cashaddrenc.cpp
     bitcoin/crypto/aes.cpp bitcoin/crypto/chacha20.cpp bitcoin/crypto/hmac_sha256.cpp bitcoin/crypto/hmac_sha512.cpp
     bitcoin/crypto/ripemd160.cpp bitcoin/crypto/sha1.cpp bitcoin/crypto/sha256.cpp bitcoin/crypto/sha256_sse4.cpp
-    bitcoin/crypto/sha3.cpp bitcoin/crypto/sha512.cpp bitcoin/crypto/siphash.cpp bitcoin/hash.cpp
+    bitcoin/crypto/sha3.cpp bitcoin/crypto/sha512.cpp bitcoin/crypto/siphash.cpp bitcoin/feerate.cpp bitcoin/hash.cpp
     bitcoin/interpreter.cpp bitcoin/logging.cpp bitcoin/netaddress.cpp bitcoin/protocol.cpp bitcoin/pubkey.cpp
     bitcoin/random.cpp bitcoin/script.cpp bitcoin/script_error.cpp bitcoin/script_standard.cpp bitcoin/sigencoding.cpp
     bitcoin/token.cpp bitcoin/transaction.cpp bitcoin/uint256.cpp bitcoin/utilsaltedhashers.cpp

@@ -120,14 +120,15 @@ public:
 struct CBlockLocator {
     std::vector<uint256> vHave;
 
-    CBlockLocator() {}
+    CBlockLocator() noexcept = default;
 
-    explicit CBlockLocator(const std::vector<uint256> &vHaveIn)
-        : vHave(vHaveIn) {}
+    explicit CBlockLocator(std::vector<uint256> &&vHaveIn) noexcept : vHave(std::move(vHaveIn)) {}
 
     SERIALIZE_METHODS(CBlockLocator, obj) {
         int nVersion = s.GetVersion();
-        if (!(s.GetType() & SER_GETHASH)) READWRITE(nVersion);
+        if (!(s.GetType() & SER_GETHASH)) {
+            READWRITE(nVersion);
+        }
         READWRITE(obj.vHave);
     }
 

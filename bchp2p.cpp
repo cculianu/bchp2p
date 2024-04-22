@@ -1,10 +1,16 @@
+#include "bitcoin/block.h"
+#include "bitcoin/bloom.h"
+#include "bitcoin/feerate.h"
 #include "bitcoin/hash.h"
 #include "bitcoin/logging.h"
 #include "bitcoin/protocol.h"
 #include "bitcoin/streams.h"
+#include "bitcoin/sync.h"
 #include "bitcoin/random.h"
 #include "bitcoin/utilstrencodings.h"
 #include "bitcoin/utiltime.h"
+
+#include "univalue.h"
 
 #include "util.h"
 
@@ -12,13 +18,15 @@
 
 #include <fmt/format.h>
 
+#include <atomic>
 #include <bit>
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <map>
-#include <set>
+#include <span>
+#include <ranges>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -36,6 +44,13 @@ using async = awaitable<T, E>; // make it look a little more like Python? ;)
 
 using namespace std::string_view_literals;
 
+using bitcoin::Mutex;
+using bitcoin::SharedMutex;
+using bitcoin::DebugLock;
+using bitcoin::DebugSharedLock;
+using bitcoin::uint256;
+using bitcoin::uint256S;
+
 struct ProtocolError : std::runtime_error
 {
     using std::runtime_error::runtime_error;
@@ -47,43 +62,80 @@ struct ChainParams
 {
     std::string_view name;
     bitcoin::CMessageHeader::MessageMagic netMagic;
-    std::pair<uint32_t, bitcoin::uint256> mostRecentCheckpoint;
+    std::pair<uint32_t, uint256> mostRecentCheckpoint;
 };
 
 enum Net : uint8_t { Main = 0, Chip, Test3, Test4, Scale, NumNets };
 
 static const std::array<ChainParams, NumNets> netChainParams = {
     ChainParams{ .name = "Main", .netMagic = {0xe3, 0xe1, 0xf3, 0xe8},
-                .mostRecentCheckpoint = {823112, bitcoin::uint256S("0000000000000000014e75464739e2b6f12a756f0d749cc15c243adb73ffbd5b")}},
+                .mostRecentCheckpoint = {823112, uint256S("0000000000000000014e75464739e2b6f12a756f0d749cc15c243adb73ffbd5b")}},
     ChainParams{ .name = "Chip", .netMagic = {0xe2, 0xb7, 0xda, 0xaf},
-                .mostRecentCheckpoint = {178140, bitcoin::uint256S("000000003c37cc0372a5b9ccacca921786bbfc699722fc41e9fdbb1de4146ef1")}},
+                .mostRecentCheckpoint = {178140, uint256S("000000003c37cc0372a5b9ccacca921786bbfc699722fc41e9fdbb1de4146ef1")}},
     ChainParams{ .name = "Test3", .netMagic = {0xf4, 0xe5, 0xf4, 0xf4},
-                .mostRecentCheckpoint = {1582896, bitcoin::uint256S("000000000000088ef4d908ed35dc511b97fe4df78d5e37ab1e1aea4084d19506")}},
+                .mostRecentCheckpoint = {1582896, uint256S("000000000000088ef4d908ed35dc511b97fe4df78d5e37ab1e1aea4084d19506")}},
     ChainParams{ .name = "Test4", .netMagic = {0xe2, 0xb7, 0xda, 0xaf},
-                .mostRecentCheckpoint = {178150, bitcoin::uint256S("00000000bd585ef9f37712bca4539acd8ec7c3b02620186dda1ee880bc07ba71")}},
+                .mostRecentCheckpoint = {178150, uint256S("00000000bd585ef9f37712bca4539acd8ec7c3b02620186dda1ee880bc07ba71")}},
     ChainParams{ .name = "Scale", .netMagic = {0xc3, 0xaf, 0xe1, 0xa2},
-                .mostRecentCheckpoint = {10000, bitcoin::uint256S("00000000b711dc753130e5083888d106f99b920b1b8a492eb5ac41d40e482905")}},
+                .mostRecentCheckpoint = {10000, uint256S("00000000b711dc753130e5083888d106f99b920b1b8a492eb5ac41d40e482905")}},
 };
 
-//static_assert
+using Id = uint64_t;
+
+inline Id GetNewId() {
+    static std::atomic<Id> nextId = 1u;
+    return nextId++;
+}
 
 struct ConnMgr
 {
-    std::set<Connection *> conns;
+    mutable SharedMutex mut;
+    std::map<Id, Connection *> conns GUARDED_BY(mut);
+    bitcoin::CRollingBloomFilter haveInvs GUARDED_BY(mut) {2'000'000, 0.0001};
+    bitcoin::CRollingBloomFilter addrKnown GUARDED_BY(mut) {500'000, 0.001};
+    size_t connsLost GUARDED_BY(mut) = 0u;
+
     asio::io_context io_context{1};
 
-    void add(Connection *c) { conns.insert(c); }
-    void rm(Connection *c) {
-        conns.erase(c);
-        if (conns.empty()) {
-            io_context.stop();
-        }
+    void add(Connection *c);
+    void rm(Connection *c);
+
+    bool haveInv_nolock(const uint256 &invHash) const SHARED_LOCKS_REQUIRED(mut) {
+        return haveInvs.contains(invHash);
     }
+
+    bool haveInv(const uint256 &invHash) const {
+        LOCK_SHARED(mut);
+        return haveInv_nolock(invHash);
+    }
+
+    void setHaveInv(const uint256 &inv) {
+        LOCK(mut);
+        haveInvs.insert(inv);
+    }
+
+    bool isAddrKnown_nolock(const bitcoin::CAddress &addr) const {
+        return addrKnown.contains(addr.GetKey());
+    }
+
+    bool isAddrKnown(const bitcoin::CAddress &addr) const {
+        LOCK_SHARED(mut);
+        return isAddrKnown_nolock(addr);
+    }
+
+    void addAddrKnown(std::span<const bitcoin::CAddress *> addrs) {
+        LOCK(mut);
+        for (auto * addr : addrs)
+            addrKnown.insert(addr->GetKey());
+    }
+
+    UniValue::Object GetStats() const;
 };
 
 class Connection
 {
     ConnMgr * const mgr;
+    const Id id = GetNewId();
     tcp::socket sock;
     bitcoin::CAddress local, remote;
     const bool inbound;
@@ -92,17 +144,21 @@ class Connection
     const std::string infoName;
     const uint64_t nLocalNonce;
     bitcoin::Tic tstart;
-    bool disconnectRequested = false, pingerScheduled = false;
+    bool disconnectRequested = false, pingerScheduled = false, cleanerScheduled = false;
 
     std::map<std::string_view, size_t> msgByteCountsIn, msgByteCountsOut, msgCountsIn{}, msgCountsOut{};
     size_t bytesIn{}, bytesOut{}, msgsIn{}, msgsOut{};
 
     int protoVersion = bitcoin::INIT_PROTO_VERSION;
     std::string cleanSubVer;
-    bool sentVersion = false, sentVerAck = false, gotVersion = false, gotVerAck = false, didAfterHandshake = false;
+    bool sentVersion = false, sentVerAck = false, gotVersion = false, gotVerAck = false, didAfterHandshake = false, didVerifyCheckPoint = false;
     bool relay = false;
     int misbehavior = 0;
+    int startingHeight = -1; // remote starting height
     static constexpr int MAX_MISBEHAVIOR = 100;
+    bitcoin::Amount feeFilter;
+
+    std::map<uint256, int64_t> requestedInvs;
 
     [[nodiscard]]
     async<> MsgHandler(bitcoin::CSerializedNetMsg msg);
@@ -116,16 +172,29 @@ class Connection
         co_await Send(CNetMsgMaker(protoVersion).Make(msg_type, std::forward<Args>(args)...));
     }
 
+    bitcoin::VectorReader MakeReader(const bitcoin::CSerializedNetMsg &msg, int protoFlags = 0, size_t pos = 0) const {
+        using namespace bitcoin;
+        return VectorReader(SER_NETWORK, protoVersion | protoFlags, msg.data, pos);
+    }
+
     [[nodiscard]] async<> HandleVersion(bitcoin::CSerializedNetMsg msg);
     [[nodiscard]] async<> HandlePing(bitcoin::CSerializedNetMsg msg);
     [[nodiscard]] async<> HandlePong(bitcoin::CSerializedNetMsg msg);
+    [[nodiscard]] async<> HandleInvs(bitcoin::CSerializedNetMsg msg);
+    [[nodiscard]] async<> HandleTx(bitcoin::CSerializedNetMsg msg);
+    [[nodiscard]] async<> HandleFeeFilter(bitcoin::CSerializedNetMsg msg);
+    [[nodiscard]] async<> HandleAddr(bitcoin::CSerializedNetMsg msg);
+    [[nodiscard]] async<> HandleHeaders(bitcoin::CSerializedNetMsg msg);
 
     [[nodiscard]] async<> DoOnceIfAfterHandshake(); // does GETADDR, etc -- stuff we do immediately after a state change to "fully established"
 
     static constexpr int pingIntervalSecs = 30;
     uint64_t lastPingNonceSent = 0;
     int64_t lastPingTSMillis = 0, lastPongTSMillis = 0, lastPingPongDelta = 0;
-    [[nodiscard]] async<> Pinger(); // periodically pings node every 60 seconds
+    [[nodiscard]] async<> Pinger(); // periodically pings node every 30 seconds
+
+    static constexpr int cleanIntervalSecs = 60;
+    [[nodiscard]] async<> Cleaner(); // periodically does cleanup
 
     std::string GetInfoStr() const {
         const int64_t nTimeMicros = bitcoin::GetTimeMicros();
@@ -134,18 +203,63 @@ class Connection
         dtstr += fmt::format(".{:06d}Z", nTimeMicros % 1'000'000);
         // this is a hack
         return fmt::format("{} {} ({})", dtstr,
-                           infoName.empty() ? remote.ToStringIPPort() : fmt::format("{}:{}", infoName, remote.ToStringPort()),
+                           infoName.empty() ? remote.ToStringIPPort() : GetName(),
                            params.name);
     }
 
     void Misbehaving(int score, std::string_view msg);
 
-    asio::steady_timer pinger;
+    asio::steady_timer pinger, cleaner;
+
+    [[nodiscard]]
+    async<> CancelProcessing() {
+        Debug("{}: Canceling processing ...\n", GetInfoStr());
+        disconnectRequested = true;
+        Debug("{}: shutdown ...\n", GetInfoStr());
+        asio::error_code ec;
+        sock.cancel(ec);
+        sock.shutdown(sock.shutdown_both);
+        pinger.cancel(ec);
+        cleaner.cancel(ec);
+        auto e = co_await this_coro::executor;
+        asio::steady_timer t(e);
+        t.expires_from_now(std::chrono::milliseconds{10});
+        co_await t.async_wait(use_awaitable);
+        Debug("{}: close ...\n", GetInfoStr());
+        sock.close();
+    }
+
+    void scheduleDisconnect() {
+        if (!disconnectRequested) {
+            disconnectRequested = true;
+            co_spawn(sock.get_executor(), CancelProcessing(), detached);
+        }
+    }
+
+    void schedulePinger() {
+        if (!pingerScheduled) {
+            pingerScheduled = true;
+            co_spawn(sock.get_executor(), Pinger(), detached);
+        }
+    }
+
+    void scheduleCleaner() {
+        if (!cleanerScheduled) {
+            cleanerScheduled = true;
+            co_spawn(sock.get_executor(), Cleaner(), detached);
+        }
+    }
+
+    unsigned GetCheckpointHeight() const {
+        return !params.mostRecentCheckpoint.second.IsNull() ? params.mostRecentCheckpoint.first : 0;
+    }
+
+    const uint256 & GetCheckpointHash() const { return params.mostRecentCheckpoint.second; }
 
 public:
     Connection(ConnMgr *mgr, tcp::socket &&s_, bool inbound_, const Net net_, std::string infoName_ = {})
         : mgr(mgr), sock(std::move(s_)), inbound(inbound_), net(net_), params(netChainParams.at(net)), infoName(std::move(infoName_)),
-          nLocalNonce(bitcoin::GetRand64()), pinger(sock.get_executor())
+          nLocalNonce(bitcoin::GetRand64()), pinger(sock.get_executor()), cleaner(sock.get_executor())
     {
         mgr->add(this);
         bitcoin::CService srv;
@@ -174,46 +288,38 @@ public:
     [[nodiscard]]
     async<> ProcessLoop();
 
-    [[nodiscard]]
-    async<> CancelProcessing() {
-        Debug("{}: Canceling processing ...\n", GetInfoStr());
-        disconnectRequested = true;
-        Debug("{}: shutdown ...\n", GetInfoStr());
-        asio::error_code ec;
-        sock.cancel(ec);
-        sock.shutdown(sock.shutdown_both);
-        pinger.cancel(ec);
-        auto e = co_await this_coro::executor;
-        asio::steady_timer t(e);
-        t.expires_from_now(std::chrono::milliseconds{10});
-        co_await t.async_wait(use_awaitable);
-        Debug("{}: close ...\n", GetInfoStr());
-        sock.close();
-    }
-
-    void scheduleDisconnect() {
-        if (!disconnectRequested) {
-            disconnectRequested = true;
-            co_spawn(sock.get_executor(), CancelProcessing(), detached);
-        }
-    }
-
-    void schedulePinger() {
-        if (!pingerScheduled) {
-            pingerScheduled = true;
-            co_spawn(sock.get_executor(), Pinger(), detached);
-        }
-    }
-
     bool isFullyConnected() const { return sentVersion && sentVerAck && gotVersion && gotVerAck; }
+
+    std::string GetName() const { return fmt::format("{}:{}", !infoName.empty() ? infoName : "???", remote.ToStringPort()); }
+
+    UniValue::Object GetStats() const;
+
+    Id GetId() const { return id; }
 };
+
+void ConnMgr::add(Connection *c) {
+    LOCK(mut);
+    auto const & [it, inserted] = conns.try_emplace(c->GetId(), c);
+    assert(inserted);
+}
+
+void ConnMgr::rm(Connection *c) {
+    LOCK(mut);
+    auto const n = conns.erase(c->GetId());
+    assert(n != 0);
+    connsLost += n;
+    if (conns.empty()) {
+        io_context.stop();
+    }
+}
+
 
 async<> Connection::SendVersion()
 {
     using namespace bitcoin;
     const int64_t nTime = static_cast<int64_t>(GetTime());
     const int64_t nLocalServices = local.nServices;
-    const int nBestHeight = 0; // GetRequireHeight();
+    const int nBestHeight = GetCheckpointHeight();
     const std::string ver = "/TestP2P:0.0.1/";
     const uint8_t fRelayTxs = 1;
     const CAddress addrMe = CAddress(CService(), ServiceFlags(nLocalServices));
@@ -341,6 +447,26 @@ async<> Connection::MsgHandler(bitcoin::CSerializedNetMsg msg)
         gotVerAck = true;
         co_return co_await DoOnceIfAfterHandshake();
     }
+
+    if (ncmd == NetMsgType::INV || ncmd == NetMsgType::NOTFOUND) {
+        co_return co_await HandleInvs(std::move(msg));
+    }
+
+    if (ncmd == NetMsgType::TX) {
+        co_return co_await HandleTx(std::move(msg));
+    }
+
+    if (ncmd == NetMsgType::FEEFILTER) {
+        co_return co_await HandleFeeFilter(std::move(msg));
+    }
+
+    if (ncmd == NetMsgType::ADDR || ncmd == NetMsgType::ADDRV2) {
+        co_return co_await HandleAddr(std::move(msg));
+    }
+
+    if (ncmd == NetMsgType::HEADERS) {
+        co_return co_await HandleHeaders(std::move(msg));
+    }
 }
 
 async<> Connection::HandleVersion(bitcoin::CSerializedNetMsg msg)
@@ -353,7 +479,7 @@ async<> Connection::HandleVersion(bitcoin::CSerializedNetMsg msg)
     }
     gotVersion = true;
 
-    VectorReader vRecv(SER_NETWORK, protoVersion, msg.data, 0);
+    VectorReader vRecv = MakeReader(msg);
     int64_t nTime;
     CAddress addrMe;
     CAddress addrFrom;
@@ -361,7 +487,6 @@ async<> Connection::HandleVersion(bitcoin::CSerializedNetMsg msg)
     uint64_t nServiceInt;
     int nVersion;
     int nSendVersion;
-    int nStartingHeight = -1;
     this->relay = true;
 
     vRecv >> nVersion >> nServiceInt >> nTime >> addrMe;
@@ -387,7 +512,7 @@ async<> Connection::HandleVersion(bitcoin::CSerializedNetMsg msg)
         Log("{}: Got subversion: {}\n", GetInfoStr(), cleanSubVer);
     }
     if (!vRecv.empty()) {
-        vRecv >> nStartingHeight;
+        vRecv >> this->startingHeight;
     }
     if (!vRecv.empty()) {
         vRecv >> this->relay;
@@ -413,6 +538,11 @@ async<> Connection::DoOnceIfAfterHandshake() {
     using namespace bitcoin;
     if (!didAfterHandshake && isFullyConnected()) {
         didAfterHandshake = true;
+        if (auto const & [height, hash] = params.mostRecentCheckpoint; !hash.IsNull()) {
+            // ask for a recent checkpoint
+            Debug("{}: Requesting checkpoint header after height {}", GetInfoStr(), height);
+            co_await Send(NetMsgType::GETHEADERS, CBlockLocator(std::vector<uint256>(1, hash)), uint256{});
+        }
         co_await Send(NetMsgType::GETADDR);
         if (protoVersion >= SENDHEADERS_VERSION) {
             // Tell our peer we prefer to receive headers rather than inv's
@@ -436,7 +566,7 @@ async<> Connection::HandlePing(bitcoin::CSerializedNetMsg msg)
     using namespace bitcoin;
     if (protoVersion > BIP0031_VERSION) {
         uint64_t nonce = 0;
-        VectorReader(SER_NETWORK, protoVersion, msg.data, 0) >> nonce;
+        MakeReader(msg) >> nonce;
         // Echo the message back with the nonce. This allows for two useful
         // features:
         //
@@ -465,7 +595,7 @@ async<> Connection::HandlePong(bitcoin::CSerializedNetMsg msg)
         problem = "spurious-pong-msg";
         reject = true;
     } else {
-        VectorReader vr(SER_NETWORK, protoVersion, msg.data, 0);
+        VectorReader vr = MakeReader(msg);
         uint64_t nonce;
         if (vr.size() >= sizeof(nonce)) {
             vr >> nonce;
@@ -490,6 +620,143 @@ async<> Connection::HandlePong(bitcoin::CSerializedNetMsg msg)
     }
 }
 
+async<> Connection::HandleInvs(bitcoin::CSerializedNetMsg msg)
+{
+    using namespace bitcoin;
+    bool const notfound = msg.m_type == NetMsgType::NOTFOUND;
+    std::vector<bitcoin::CInv> invs;
+    MakeReader(msg) >> invs;
+    Debug("{}: Got {} inv(s){}", GetInfoStr(), invs.size(), notfound ? " NOTFOUND" : "");
+    if (invs.size() > MAX_INV_SZ) {
+        Misbehaving(20, "oversized-inv");
+        co_return co_await Send(NetMsgType::REJECT, NetMsgType::INV, REJECT_INVALID, "oversized-inv"sv);
+    }
+    // handle NOTFOUND
+    if (notfound) {
+        unsigned ct = 0;
+        for (auto const & inv : invs) {
+            if (inv.IsTx()) {
+                ++ct;
+                requestedInvs.erase(inv.hash);
+            }
+        }
+        if (ct)
+            Debug("{}: {} txns returned not found!", GetInfoStr(), ct);
+        co_return;
+    }
+
+    // handle normal INV
+    std::vector<bitcoin::CInv> dontHaveTxs;
+    dontHaveTxs.reserve(invs.size());
+    {
+        LOCK_SHARED(mgr->mut);
+        for (auto & inv : invs) {
+            if (inv.IsTx()) {
+                if (!mgr->haveInv_nolock(inv.hash) && !requestedInvs.contains(inv.hash)) {
+                    dontHaveTxs.push_back(std::move(inv));
+                    Debug("{}: Got new inv: {}", GetInfoStr(), dontHaveTxs.back().ToString());
+                } else {
+                    Debug("{}: Ignoring inv: {}", GetInfoStr(), dontHaveTxs.back().ToString());
+                }
+            } else {
+                Debug("{}: Ignoring non-tx inv: {}", GetInfoStr(), inv.ToString());
+            }
+        }
+    }
+    invs = decltype(invs){}; // clear `invs` memory
+    if ( ! dontHaveTxs.empty()) {
+        auto const now = GetTimeMicros();
+        for (const auto & inv : dontHaveTxs) {
+            requestedInvs[inv.hash] = now;
+            assert(inv.IsTx());
+        }
+        Debug("{}: Requesting {} txns ...", GetInfoStr(), dontHaveTxs.size());
+        co_await Send(NetMsgType::GETDATA, std::move(dontHaveTxs));
+    }
+}
+
+async<> Connection::HandleTx(bitcoin::CSerializedNetMsg msg)
+{
+    using namespace bitcoin;
+    CTransactionRef tx;
+    MakeReader(msg) >> tx;
+
+    double elapsedMSec;
+    if (auto it = requestedInvs.find(tx->GetHashRef()); it == requestedInvs.end()) {
+        Misbehaving(1, fmt::format("Unrequested tx {}", tx->GetHashRef().ToString()));
+        co_return;
+    } else {
+        elapsedMSec = (GetTimeMicros() - it->second) / 1e3;
+        requestedInvs.erase(it);
+    }
+    mgr->setHaveInv(tx->GetHashRef());
+    Debug("{}: Got tx GETDATA reply in {:1.3f} msec. Txid: {}, size: {}, version: {}, nins: {}, nouts: {}",
+          GetInfoStr(), elapsedMSec, tx->GetHashRef().ToString(), tx->GetTotalSize(), tx->nVersion,
+          tx->vin.size(), tx->vout.size());
+}
+
+async<> Connection::HandleFeeFilter(bitcoin::CSerializedNetMsg msg)
+{
+    using namespace bitcoin;
+    Amount newFeeFilter;
+    MakeReader(msg) >> newFeeFilter;
+    if (MoneyRange(newFeeFilter)) {
+        Log("{}: {}: {} -> {}", GetInfoStr(),
+            styled(msg.m_type, fg(Color::bright_yellow)),
+            CFeeRate(feeFilter).ToString(), CFeeRate(newFeeFilter).ToString());
+        feeFilter = newFeeFilter;
+    } else {
+        auto const err = fmt::format("bad-fee-filter ({})", newFeeFilter.ToString());
+        Misbehaving(1, err);
+        co_await Send(NetMsgType::REJECT, msg.m_type, REJECT_INVALID, err);
+    }
+}
+
+async<> Connection::HandleAddr(bitcoin::CSerializedNetMsg msg)
+{
+    using namespace bitcoin;
+    std::vector<CAddress> vAddr;
+    const int flags = msg.m_type == NetMsgType::ADDRV2 ? ADDRV2_FORMAT : 0;
+    MakeReader(msg, flags) >> vAddr;
+
+    if (vAddr.size() > MAX_ADDR_TO_SEND) {
+        auto err = "oversized-addr"sv;
+        Misbehaving(20, "oversized-addr");
+        co_return co_await Send(NetMsgType::REJECT, msg.m_type, REJECT_INVALID, err);
+    }
+    std::vector<const CAddress *> newAddrs;
+    newAddrs.reserve(vAddr.size());
+    {
+        LOCK_SHARED(mgr->mut);
+        for (auto const & addr : vAddr)
+            if (!mgr->isAddrKnown_nolock(addr))
+                newAddrs.push_back(&addr);
+    }
+    mgr->addAddrKnown({newAddrs.data(), newAddrs.size()});
+    Log("{}: Got {}/{} new addresses", GetInfoStr(), newAddrs.size(), vAddr.size());
+}
+
+async<> Connection::HandleHeaders(bitcoin::CSerializedNetMsg msg)
+{
+    using namespace bitcoin;
+    auto vr = MakeReader(msg);
+    std::vector<CBlockHeader> hdrs;
+    vr >> hdrs;
+    if (hdrs.size() > MAX_HEADERS_RESULTS) {
+        auto err = fmt::format("Too many headers ({})", hdrs.size());
+        Misbehaving(100, err);
+        co_return co_await Send(NetMsgType::REJECT, msg.m_type, REJECT_INVALID, err);
+    }
+    Debug("{}: Got {} headers", GetInfoStr(), hdrs.size());
+    if (!hdrs.empty() && !didVerifyCheckPoint && !GetCheckpointHash().IsNull() && startingHeight > -1 && GetCheckpointHeight() < unsigned(startingHeight)) {
+        auto const & hdr = hdrs.front();
+        if (hdr.hashPrevBlock == GetCheckpointHash()) {
+            didVerifyCheckPoint = true;
+            Log("{}: Checkpoint at height {} verified", GetInfoStr(), GetCheckpointHeight());
+        }
+    }
+}
+
 async<> Connection::Pinger()
 {
     using namespace bitcoin;
@@ -497,7 +764,7 @@ async<> Connection::Pinger()
     Defer d([&]{ Debug("{}: Pinger stopped", GetInfoStr()); });
 
     while (!disconnectRequested) {
-        if (!disconnectRequested && isFullyConnected()) {
+        if (isFullyConnected()) {
             if (lastPingTSMillis && /* test for neg. below 1 sec: */ lastPongTSMillis - lastPingTSMillis < -1'000'000) {
                 Misbehaving(10, "No recent ping reply");
             }
@@ -512,17 +779,134 @@ async<> Connection::Pinger()
     }
 }
 
+async<> Connection::Cleaner()
+{
+    using namespace bitcoin;
+    Debug("{}: Cleaner started", GetInfoStr());
+    Defer d([&]{ Debug("{}: Cleaner stopped", GetInfoStr()); });
+
+    while (!disconnectRequested) {
+        if (isFullyConnected()) {
+            // clean up expired "requestedInvs" messages
+            auto const now = GetTimeMicros();
+            std::vector<uint256> expired;
+            for (auto const & [hash, time] : requestedInvs) {
+                if (now - time > cleanIntervalSecs * 1'000'000)
+                    expired.push_back(hash);
+            }
+            if ( ! expired.empty()) {
+                Debug("{}: Deleting {}/{} expired in flight invs ...", GetInfoStr(), expired.size(), requestedInvs.size());
+                for (auto const & hash : expired) requestedInvs.erase(hash);
+            }
+        }
+        // sleep 5 secs if not yet fully connected or 30 otherwise
+        cleaner.expires_from_now(std::chrono::seconds{isFullyConnected() ? cleanIntervalSecs : 5});
+        co_await cleaner.async_wait(use_awaitable);
+        Debug("{}: Cleaner wakeup ..", GetInfoStr());
+    }
+}
+
+UniValue::Object Connection::GetStats() const
+{
+    UniValue::Object ret;
+    ret.reserve(21);
+    ret.emplace_back("id", GetId());
+    ret.emplace_back("connected", sock.is_open());
+    ret.emplace_back("fully connected", isFullyConnected());
+    ret.emplace_back("net", params.name);
+    ret.emplace_back("local", local.ToString());
+    ret.emplace_back("remote", remote.ToString());
+    if (lastPingPongDelta != 0) ret.emplace_back("ping_msec", lastPingPongDelta);
+    ret.emplace_back("subver", cleanSubVer);
+    ret.emplace_back("version", protoVersion);
+    ret.emplace_back("serviceFlags", fmt::format("{:#011b}", uint64_t(remote.nServices)));
+    ret.emplace_back("relay", relay);
+    ret.emplace_back("misbehavior", fmt::format("{}/{}", misbehavior, MAX_MISBEHAVIOR));
+    ret.emplace_back("startingHeight", startingHeight);
+    ret.emplace_back("checkpointVerified", didVerifyCheckPoint);
+    ret.emplace_back("elapsed (secs)", tstart.secsStr());
+    ret.emplace_back("bytesIn", bytesIn);
+    ret.emplace_back("bytesOut", bytesOut);
+    ret.emplace_back("msgsIn", msgsIn);
+    ret.emplace_back("msgsOut", msgsOut);
+    struct Cts {
+        size_t ctIn{}, ctOut{}, bytesIn{}, bytesOut{};
+    };
+    using Ctr = std::map<std::string_view, Cts>;
+    Ctr ctr;
+    for (auto const & [msg, val]: msgByteCountsIn) ctr[msg].bytesIn += val;
+    for (auto const & [msg, val]: msgByteCountsOut) ctr[msg].bytesOut += val;
+    for (auto const & [msg, val]: msgCountsIn) ctr[msg].ctIn += val;
+    for (auto const & [msg, val]: msgCountsOut) ctr[msg].ctOut += val;
+
+    UniValue::Object uvmsgctr;
+    uvmsgctr.reserve(ctr.size());
+    for (auto const & [msg, cts] : ctr) {
+        UniValue::Object subobj;
+        subobj.reserve(4);
+        subobj.emplace_back("bytesIn", cts.bytesIn);
+        subobj.emplace_back("bytesOut", cts.bytesOut);
+        subobj.emplace_back("msgsIn", cts.ctIn);
+        subobj.emplace_back("msgsOut", cts.ctOut);
+        uvmsgctr.emplace_back(msg, std::move(subobj));
+    }
+
+    ret.emplace_back("message stats", std::move(uvmsgctr));
+
+    UniValue::Object uvinvs;
+    uvinvs.reserve(requestedInvs.size());
+    auto const now = bitcoin::GetTimeMicros();
+    for (auto const & [hash, time]: requestedInvs) {
+        uvinvs.emplace_back(hash.ToString(), (now - time) / 1e6);
+    }
+
+    ret.emplace_back("invs in flight", std::move(uvinvs));
+
+    return ret;
+}
+
+UniValue::Object ConnMgr::GetStats() const
+{
+    UniValue::Object ret;
+    ret.reserve(3);
+    LOCK_SHARED(mut);
+    ret.emplace_back("num_conns", conns.size());
+    ret.emplace_back("num_lost_conns", connsLost);
+    UniValue::Object uvconns;
+    uvconns.reserve(conns.size());
+    for (auto const *c : conns | std::views::values) {
+        uvconns.emplace_back(c->GetName(), c->GetStats());
+    }
+    ret.emplace_back("connections", std::move(uvconns));
+    return ret;
+}
+
 async<> client(ConnMgr *mgr, Net net, std::string_view hostname, uint16_t port) {
     auto portstr = fmt::format("{}", port);
     auto executor = co_await this_coro::executor;
-    tcp::socket sock(executor);
-    tcp::resolver rslv(executor);
-    auto results = co_await rslv.async_resolve(hostname, portstr, use_awaitable);
-    if (results.empty()) throw std::runtime_error(fmt::format("Unable to resolve {}:{}", hostname, port));
-    co_await asio::async_connect(sock, results, use_awaitable);
-    if (!sock.is_open()) throw std::runtime_error(fmt::format("Socket not open for {}:{}", hostname, port));
-    Connection conn(mgr, std::move(sock), false, net, std::string{hostname});
-    co_await conn.ProcessLoop();
+    for (;;) {
+        try {
+            tcp::socket sock(executor);
+            tcp::resolver rslv(executor);
+            Log("Connecting to {}:{} ...", hostname, portstr);
+            auto results = co_await rslv.async_resolve(hostname, portstr, use_awaitable);
+            if (results.empty()) throw std::runtime_error("Unable to resolve, no results");
+            co_await asio::async_connect(sock, results, use_awaitable);
+            if (!sock.is_open()) throw std::runtime_error("Socket not open");
+            Connection conn(mgr, std::move(sock), false, net, std::string{hostname});
+            co_await conn.ProcessLoop();
+        } catch (const std::exception &e) {
+            Warning("{}:{}: Error: '{}' -- Will try again in 5 minutes ...", hostname, portstr, e.what());
+        }
+        asio::steady_timer timer(executor);
+        timer.expires_from_now(std::chrono::minutes{5});
+        co_await timer.async_wait(use_awaitable);
+    }
+}
+
+void printStats(const ConnMgr &mgr)
+{
+    Log("\n--- Stats:\n{}\n", styled(UniValue::stringify(mgr.GetStats(), 2), fg(Color::green)|bg(Color::black)|fmt::emphasis::bold));
 }
 
 int main() {
@@ -537,24 +921,35 @@ int main() {
         ConnMgr mgr;
         asio::io_context & io_context = mgr.io_context;
 
-        asio::signal_set signals(io_context, SIGINT, SIGTERM);
-        signals.async_wait([&](std::error_code ec, int sig){
-            if (!ec) {
-                fmt::print(fg(Color::green)|fmt::emphasis::italic, "\n--- Caught signal {}, exiting ...\n", styled(sig, fg(Color::bright_white)|bg(Color::blue)));
-                io_context.stop();
-            } else {
-                Error("\n--- Sighandler error: {}", styled(ec.message(), fg(Color::bright_white)|bg(Color::blue)));
-            }
-        });
+        asio::signal_set signals(io_context, SIGINT, SIGTERM, SIGUSR1);
+        std::function<void()> registerSigs;
+        registerSigs = [&] {
+            signals.async_wait([&](std::error_code ec, int sig){
+                if (!ec) {
+                    if (sig == SIGUSR1) {
+                        printStats(mgr);
+                        // upon receiving the sig, we must re-register
+                        registerSigs();
+                        return;
+                    }
+                    fmt::print(fg(Color::green)|fmt::emphasis::italic, "\n--- Caught signal {}, exiting ...\n", styled(sig, fg(Color::bright_white)|bg(Color::blue)));
+                    io_context.stop();
+                } else {
+                    Error("\n--- Sighandler error: {}", styled(ec.message(), fg(Color::bright_white)|bg(Color::blue)));
+                }
+            });
+        };
+        registerSigs();
 
         size_t errct = 0;
 
         using HP = std::tuple<Net, std::string_view, uint16_t>;
         std::array hp = {
             HP{Main, "localhost", 8888}, // this should error
+            HP{Main, "thisshouldfail.google.com", 8888}, // this should error
             HP{Main, "c3.c3-soft.com", 8333},
             HP{Chip, "c3.c3-soft.com", 48333},
-            HP{Main, "bch.loping.net", 8333},
+            //HP{Main, "bch.loping.net", 8333},
             HP{Main, "tbch.loping.net", 18333}, // this is wrong -- testing error case
             HP{Scale, "sbch.loping.net", 38333},
         };

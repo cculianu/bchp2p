@@ -543,4 +543,19 @@ inline constexpr uint8_t REJECT_CHECKPOINT = 0x43;
 /** Maximum length of the user agent string in `version` message; from net.h */
 inline constexpr unsigned int MAX_SUBVERSION_LENGTH = 256;
 
+/** The maximum number of entries in an 'inv' protocol message; from net.h */
+inline constexpr unsigned int MAX_INV_SZ = 50000;
+static_assert(MAX_PROTOCOL_MESSAGE_LENGTH > MAX_INV_SZ * sizeof(CInv),
+              "Max protocol message length must be greater than largest possible INV message");
+
+/** The maximum number of addresses from our addrman to return in response to a getaddr message; from net.h */
+static constexpr size_t MAX_ADDR_TO_SEND = 1000;
+
+/**
+ * Number of headers sent in one getheaders result. We rely on the assumption
+ * that if a peer sends less than this number, we reached its tip. Changing this
+ * value is a protocol upgrade. From validation.h.
+ */
+static constexpr unsigned int MAX_HEADERS_RESULTS = 2000;
+
 } // namespace bitcoin
