@@ -959,11 +959,12 @@ int main() {
         asio::io_context & io_context = mgr.io_context;
 
         asio::signal_set signals(io_context, SIGINT, SIGTERM, SIGUSR1);
+        signals.add(SIGQUIT);
         std::function<void()> registerSigs;
         registerSigs = [&] {
             signals.async_wait([&](std::error_code ec, int sig){
                 if (!ec) {
-                    if (sig == SIGUSR1) {
+                    if (sig == SIGUSR1 || sig == SIGQUIT) {
                         printStats(mgr);
                         // upon receiving the sig, we must re-register
                         registerSigs();
