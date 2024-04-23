@@ -65,19 +65,21 @@ struct ChainParams
     std::pair<uint32_t, uint256> mostRecentCheckpoint;
 };
 
-enum Net : uint8_t { Main = 0, Chip, Test3, Test4, Scale, NumNets };
+enum Net : uint8_t { Main = 0, Chip, Test3, Test4, Scale, Reg, NumNets };
 
 static const std::array<ChainParams, NumNets> netChainParams = {
     ChainParams{ .name = "Main", .netMagic = {0xe3, 0xe1, 0xf3, 0xe8},
-                .mostRecentCheckpoint = {823112, uint256S("0000000000000000014e75464739e2b6f12a756f0d749cc15c243adb73ffbd5b")}},
+                 .mostRecentCheckpoint = {823112,  uint256S("0000000000000000014e75464739e2b6f12a756f0d749cc15c243adb73ffbd5b")}},
     ChainParams{ .name = "Chip", .netMagic = {0xe2, 0xb7, 0xda, 0xaf},
-                .mostRecentCheckpoint = {178140, uint256S("000000003c37cc0372a5b9ccacca921786bbfc699722fc41e9fdbb1de4146ef1")}},
+                 .mostRecentCheckpoint = {178140,  uint256S("000000003c37cc0372a5b9ccacca921786bbfc699722fc41e9fdbb1de4146ef1")}},
     ChainParams{ .name = "Test3", .netMagic = {0xf4, 0xe5, 0xf4, 0xf4},
-                .mostRecentCheckpoint = {1582896, uint256S("000000000000088ef4d908ed35dc511b97fe4df78d5e37ab1e1aea4084d19506")}},
+                 .mostRecentCheckpoint = {1582896, uint256S("000000000000088ef4d908ed35dc511b97fe4df78d5e37ab1e1aea4084d19506")}},
     ChainParams{ .name = "Test4", .netMagic = {0xe2, 0xb7, 0xda, 0xaf},
-                .mostRecentCheckpoint = {178150, uint256S("00000000bd585ef9f37712bca4539acd8ec7c3b02620186dda1ee880bc07ba71")}},
+                 .mostRecentCheckpoint = {178150,  uint256S("00000000bd585ef9f37712bca4539acd8ec7c3b02620186dda1ee880bc07ba71")}},
     ChainParams{ .name = "Scale", .netMagic = {0xc3, 0xaf, 0xe1, 0xa2},
-                .mostRecentCheckpoint = {10000, uint256S("00000000b711dc753130e5083888d106f99b920b1b8a492eb5ac41d40e482905")}},
+                 .mostRecentCheckpoint = {10000,   uint256S("00000000b711dc753130e5083888d106f99b920b1b8a492eb5ac41d40e482905")}},
+    ChainParams{ .name = "Reg",   .netMagic = {0xda, 0xb5, 0xbf, 0xfa},
+                 .mostRecentCheckpoint = {0,       uint256S("0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206")}},
 };
 
 using Id = uint64_t;
@@ -661,7 +663,7 @@ async<> Connection::HandleInvs(bitcoin::CSerializedNetMsg && msg)
                     dontHaveTxs.push_back(std::move(inv));
                     Debug("{}: Got new inv: {}", GetInfoStr(), dontHaveTxs.back().ToString());
                 } else {
-                    Debug("{}: Ignoring inv: {}", GetInfoStr(), dontHaveTxs.back().ToString());
+                    Debug("{}: Ignoring inv: {}", GetInfoStr(), inv.ToString());
                 }
             } else {
                 Debug("{}: Ignoring non-tx inv: {}", GetInfoStr(), inv.ToString());
@@ -915,6 +917,7 @@ async<> client(ConnMgr *mgr, Net net, std::string_view hostname, uint16_t port) 
     auto portstr = fmt::format("{}", port);
     auto executor = co_await this_coro::executor;
     for (;;) {
+        std::string excMsg;
         try {
             tcp::socket sock(executor);
             tcp::resolver rslv(executor);
@@ -926,8 +929,12 @@ async<> client(ConnMgr *mgr, Net net, std::string_view hostname, uint16_t port) 
             Connection conn(mgr, std::move(sock), false, net, std::string{hostname});
             co_await conn.ProcessLoop();
         } catch (const std::exception &e) {
-            Warning("{}:{}: Error: '{}' -- Will try again in 5 minutes ...", hostname, portstr, e.what());
+            excMsg = e.what();
         }
+        if (!excMsg.empty())
+            Warning("{}:{}: Error: '{}' -- Will try again in 5 minutes ...", hostname, portstr, excMsg);
+        else
+            Warning("{}:{}: Connection lost, will try again in 5 minutes ...", hostname, portstr);
         asio::steady_timer timer(executor);
         timer.expires_from_now(std::chrono::minutes{5});
         co_await timer.async_wait(use_awaitable);
@@ -979,9 +986,10 @@ int main() {
             HP{Main, "thisshouldfail.google.com", 8888}, // this should error
             HP{Main, "c3.c3-soft.com", 8333},
             HP{Chip, "c3.c3-soft.com", 48333},
-            //HP{Main, "bch.loping.net", 8333},
+            HP{Main, "bch.loping.net", 8333},
             HP{Main, "tbch.loping.net", 18333}, // this is wrong -- testing error case
             HP{Scale, "sbch.loping.net", 38333},
+            HP{Reg, "localhost", 9333}, // our regtest node.. should normally fail but maybe is up sometimes
         };
 
         auto handler = [&](std::string_view host, uint16_t port, std::exception_ptr exc) {
