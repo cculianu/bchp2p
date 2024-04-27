@@ -419,6 +419,7 @@ async<> Connection::MsgHandler(bitcoin::CSerializedNetMsg && msg)
     Log("{}: Got message: {}, size: {}\n", GetInfoStr(), msg.m_type, msize);
     // tally byte counts. Note: Normalize() should return a "peristent" string_view for this to not be UB!
     std::string_view const ncmd = NetMsgType::Normalize(msg.m_type);
+    msg.m_type = ncmd; // writeback the normalized cmd to msg.m_type, so called-code doesn't have to worry
     msgByteCountsIn[ncmd] += msize;
     ++msgCountsIn[ncmd];
     bytesIn += msize;
@@ -428,51 +429,57 @@ async<> Connection::MsgHandler(bitcoin::CSerializedNetMsg && msg)
         Log("{}: Handled '{}' in {} msec\n", GetInfoStr(), ncmd, t0.msecStr());
     });
 
-    if (ncmd == NetMsgType::VERSION) {
-        co_return co_await HandleVersion(std::move(msg));
-    }
+    try {
+        if (ncmd == NetMsgType::VERSION) {
+            co_return co_await HandleVersion(std::move(msg));
+        }
 
-    if (!gotVersion) {
-        // Must have a version message before anything else
-        Misbehaving(10, "missing-version"sv);
-        co_return;
-    }
+        if (!gotVersion) {
+            // Must have a version message before anything else
+            Misbehaving(10, "missing-version"sv);
+            co_return;
+        }
 
-    if (ncmd == NetMsgType::PING) {
-        co_return co_await HandlePing(std::move(msg));
-    }
+        if (ncmd == NetMsgType::PING) {
+            co_return co_await HandlePing(std::move(msg));
+        }
 
-    if (ncmd == NetMsgType::PONG) {
-        co_return co_await HandlePong(std::move(msg));
-    }
+        if (ncmd == NetMsgType::PONG) {
+            co_return co_await HandlePong(std::move(msg));
+        }
 
-    if (ncmd == NetMsgType::VERACK) {
-        gotVerAck = true;
-        co_return co_await DoOnceIfAfterHandshake();
-    }
+        if (ncmd == NetMsgType::VERACK) {
+            gotVerAck = true;
+            co_return co_await DoOnceIfAfterHandshake();
+        }
 
-    if (ncmd == NetMsgType::INV || ncmd == NetMsgType::NOTFOUND) {
-        co_return co_await HandleInvs(std::move(msg));
-    }
+        if (ncmd == NetMsgType::INV || ncmd == NetMsgType::NOTFOUND) {
+            co_return co_await HandleInvs(std::move(msg));
+        }
 
-    if (ncmd == NetMsgType::TX) {
-        co_return co_await HandleTx(std::move(msg));
-    }
+        if (ncmd == NetMsgType::TX) {
+            co_return co_await HandleTx(std::move(msg));
+        }
 
-    if (ncmd == NetMsgType::FEEFILTER) {
-        co_return co_await HandleFeeFilter(std::move(msg));
-    }
+        if (ncmd == NetMsgType::FEEFILTER) {
+            co_return co_await HandleFeeFilter(std::move(msg));
+        }
 
-    if (ncmd == NetMsgType::ADDR || ncmd == NetMsgType::ADDRV2) {
-        co_return co_await HandleAddr(std::move(msg));
-    }
+        if (ncmd == NetMsgType::ADDR || ncmd == NetMsgType::ADDRV2) {
+            co_return co_await HandleAddr(std::move(msg));
+        }
 
-    if (ncmd == NetMsgType::HEADERS) {
-        co_return co_await HandleHeaders(std::move(msg));
-    }
+        if (ncmd == NetMsgType::HEADERS) {
+            co_return co_await HandleHeaders(std::move(msg));
+        }
 
-    if (ncmd == NetMsgType::REJECT) {
-        co_return co_await HandleReject(std::move(msg));
+        if (ncmd == NetMsgType::REJECT) {
+            co_return co_await HandleReject(std::move(msg));
+        }
+
+    } catch (const std::ios_base::failure &e) {
+        Warning("{}: Unserialize error processing message: '{}', exception was: {}", GetInfoStr(), ncmd, e.what());
+        Misbehaving(1, "unserialize-error");
     }
 }
 
@@ -767,25 +774,20 @@ async<> Connection::HandleHeaders(bitcoin::CSerializedNetMsg && msg)
 async<> Connection::HandleReject(bitcoin::CSerializedNetMsg && msg)
 {
     using namespace bitcoin;
-    try {
-        std::string strMsg;
-        uint8_t ccode;
-        std::string strReason;
-        auto vr = MakeReader(msg);
-        vr >> LIMITED_STRING(strMsg, CMessageHeader::COMMAND_SIZE) >> ccode
-           >> LIMITED_STRING(strReason, MAX_REJECT_MESSAGE_LENGTH);
+    std::string strMsg;
+    uint8_t ccode;
+    std::string strReason;
+    auto vr = MakeReader(msg);
+    vr >> LIMITED_STRING(strMsg, CMessageHeader::COMMAND_SIZE) >> ccode
+       >> LIMITED_STRING(strReason, MAX_REJECT_MESSAGE_LENGTH);
 
-        auto msg = fmt::format("{} code {}: {}", strMsg, ccode, strReason);
-        if (strMsg == NetMsgType::BLOCK || strMsg == NetMsgType::TX) {
-            uint256 hash;
-            vr >> hash;
-            msg += fmt::format(": hash {}", hash.ToString());
-        }
-        Warning("{}: Reject {}", GetInfoStr(), SanitizeString(msg));
-    } catch (const std::ios_base::failure &) {
-        // Avoid feedback loops by preventing reject messages from triggering a new reject message.
-        Warning("{}: Unparseable reject message received", GetInfoStr());
+    auto errmsg = fmt::format("{} code {}: {}", strMsg, ccode, strReason);
+    if (strMsg == NetMsgType::BLOCK || strMsg == NetMsgType::TX) {
+        uint256 hash;
+        vr >> hash;
+        errmsg += fmt::format(": hash {}", hash.ToString());
     }
+    Warning("{}: Reject {}", GetInfoStr(), SanitizeString(errmsg));
     co_return;
 }
 
