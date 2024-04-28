@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.5)
 
 set(CMAKE_USER_MAKE_RULES_OVERRIDE "${CMAKE_SOURCE_DIR}/cmake/modules/OverrideInitFlags.cmake")
 
-project(bchp2p LANGUAGES CXX)
+project(bchp2p LANGUAGES CXX VERSION 1.0.0)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -20,6 +20,9 @@ find_package(fmt REQUIRED)
 
 # asio
 find_package(asio REQUIRED)
+
+# Boost
+find_package(Boost 1.71.0 REQUIRED)
 
 # UniValue
 set(BUILD_BENCH OFF CACHE INTERNAL "Used by UniValue, disabled" FORCE)
@@ -56,7 +59,9 @@ target_link_libraries(asiotest fmt::fmt asio::asio univalue bitcoin)
 # bchp2p using asio
 add_executable(bchp2p bchp2p.cpp util.cpp)
 target_compile_options(bchp2p PRIVATE -Wall -Wno-unused-parameter)
-target_link_libraries(bchp2p fmt::fmt asio::asio univalue bitcoin)
+target_link_libraries(bchp2p fmt::fmt asio::asio Boost::boost univalue bitcoin)
+
+add_compile_definitions(VERSION_STR=\"${CMAKE_PROJECT_VERSION}\")
 
 #include(GNUInstallDirs)
 #install(TARGETS bchp2p

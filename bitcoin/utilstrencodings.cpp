@@ -787,7 +787,7 @@ std::string Capitalize(std::string str) {
     return str;
 }
 
-std::string ToLower(const std::string &str) {
+std::string ToLower(const std::string_view str) {
     std::string r;
     r.reserve(str.size());
     for (auto ch : str)
@@ -795,7 +795,7 @@ std::string ToLower(const std::string &str) {
     return r;
 }
 
-std::string ToUpper(const std::string &str) {
+std::string ToUpper(const std::string_view str) {
     std::string r;
     r.reserve(str.size());
     for (auto ch : str)

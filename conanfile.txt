@@ -1,6 +1,7 @@
 [requires]
 fmt/10.2.1
 asio/1.30.2
+boost/1.84.0
 
 [generators]
 CMakeDeps
@@ -8,3 +9,6 @@ CMakeToolchain
 
 [layout]
 cmake_layout
+
+[options]
+boost*:header_only=True

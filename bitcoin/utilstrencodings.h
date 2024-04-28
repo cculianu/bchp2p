@@ -12,6 +12,7 @@
 
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace bitcoin  {
@@ -236,7 +237,7 @@ constexpr unsigned char ToLower(unsigned char c) {
  * @param[in] str   the string to convert to lowercase.
  * @returns         lowercased equivalent of str
  */
-std::string ToLower(const std::string &str);
+std::string ToLower(std::string_view str);
 
 /**
  * Converts the given string to its lowercase equivalent.
@@ -267,7 +268,7 @@ constexpr unsigned char ToUpper(unsigned char c) {
  * @param[in] str   the string to convert to uppercase.
  * @returns         UPPERCASED EQUIVALENT OF str
  */
-std::string ToUpper(const std::string& str);
+std::string ToUpper(std::string_view str);
 
 /**
  * Capitalizes the first character of the given string.

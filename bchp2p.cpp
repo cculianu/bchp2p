@@ -10,27 +10,34 @@
 #include "bitcoin/utilstrencodings.h"
 #include "bitcoin/utiltime.h"
 
+#include "argparse.hpp"
 #include "univalue.h"
-
 #include "util.h"
 
 #include <asio.hpp>
-
+#include <boost/algorithm/string.hpp>
+#include <boost/range/adaptors.hpp>
 #include <fmt/format.h>
 
 #include <atomic>
 #include <bit>
+#include <charconv>
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <deque>
+#include <iostream>
 #include <map>
+#include <memory>
+#include <optional>
 #include <span>
 #include <ranges>
 #include <string>
 #include <string_view>
 #include <system_error>
 #include <utility>
+#include <vector>
 
 using asio::ip::tcp;
 using asio::awaitable;
@@ -42,6 +49,16 @@ namespace this_coro = asio::this_coro;
 template <typename T = void, typename E = asio::any_io_executor>
 using async = awaitable<T, E>; // make it look a little more like Python? ;)
 
+/// Keeps `context` object alive for as long as this task is alive, by retaining a shared_ptr to it.
+template <typename Ctx, typename Completion, typename T = void, typename E = asio::any_io_executor>
+void co_spawn_shared(const std::enable_shared_from_this<Ctx> &context, const asio::any_io_executor &executor,
+                     async<T, E> && task, Completion && token) {
+    co_spawn(executor, [&]() -> async<T, E>{
+        auto shared = context.shared_from_this(); // keep `context` alive for as long as this task is alive
+        co_return co_await std::move(task);
+    }(), std::forward<Completion>(token));
+}
+
 using namespace std::string_view_literals;
 
 using bitcoin::Mutex;
@@ -50,6 +67,8 @@ using bitcoin::DebugLock;
 using bitcoin::DebugSharedLock;
 using bitcoin::uint256;
 using bitcoin::uint256S;
+
+namespace {
 
 struct ProtocolError : std::runtime_error
 {
@@ -67,12 +86,12 @@ struct ChainParams
 
 enum Net : uint8_t { Main = 0, Chip, Test3, Test4, Scale, Reg, NumNets };
 
-static const std::array<ChainParams, NumNets> netChainParams = {
+const std::array<ChainParams, NumNets> netChainParams = {
     ChainParams{ .name = "Main", .netMagic = {0xe3, 0xe1, 0xf3, 0xe8},
                  .mostRecentCheckpoint = {823112,  uint256S("0000000000000000014e75464739e2b6f12a756f0d749cc15c243adb73ffbd5b")}},
     ChainParams{ .name = "Chip", .netMagic = {0xe2, 0xb7, 0xda, 0xaf},
                  .mostRecentCheckpoint = {178140,  uint256S("000000003c37cc0372a5b9ccacca921786bbfc699722fc41e9fdbb1de4146ef1")}},
-    ChainParams{ .name = "Test3", .netMagic = {0xf4, 0xe5, 0xf4, 0xf4},
+    ChainParams{ .name = "Test3", .netMagic = {0xf4, 0xe5, 0xf3, 0xf4},
                  .mostRecentCheckpoint = {1582896, uint256S("000000000000088ef4d908ed35dc511b97fe4df78d5e37ab1e1aea4084d19506")}},
     ChainParams{ .name = "Test4", .netMagic = {0xe2, 0xb7, 0xda, 0xaf},
                  .mostRecentCheckpoint = {178150,  uint256S("00000000bd585ef9f37712bca4539acd8ec7c3b02620186dda1ee880bc07ba71")}},
@@ -81,6 +100,26 @@ static const std::array<ChainParams, NumNets> netChainParams = {
     ChainParams{ .name = "Reg",   .netMagic = {0xda, 0xb5, 0xbf, 0xfa},
                  .mostRecentCheckpoint = {0,       uint256S("0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206")}},
 };
+
+std::string_view Net2Name(Net net) {
+    if (size_t(net) < netChainParams.size()) return netChainParams[size_t(net)].name;
+    return ""sv;
+}
+
+std::optional<Net> Name2Net(std::string_view name, bool caseSensitive = false) {
+    if (caseSensitive) {
+        for (size_t i = 0; i < netChainParams.size(); ++i)
+            if (name == netChainParams[i].name) return Net(i);
+    } else {
+        for (size_t i = 0; i < netChainParams.size(); ++i) {
+            std::string lhs{name}, rhs{netChainParams[i].name};
+            boost::algorithm::to_lower(lhs);
+            boost::algorithm::to_lower(rhs);
+            if (lhs == rhs) return Net(i);
+        }
+    }
+    return std::nullopt;
+}
 
 using Id = uint64_t;
 
@@ -92,15 +131,22 @@ inline Id GetNewId() {
 struct ConnMgr
 {
     mutable SharedMutex mut;
-    std::map<Id, Connection *> conns GUARDED_BY(mut);
+private:
     bitcoin::CRollingBloomFilter haveInvs GUARDED_BY(mut) {2'000'000, 0.0001};
     bitcoin::CRollingBloomFilter addrKnown GUARDED_BY(mut) {500'000, 0.001};
     size_t connsLost GUARDED_BY(mut) = 0u;
+    std::atomic_size_t nInbound = 0u, nOutbound = 0u;
+    std::map<Id, std::weak_ptr<Connection>> conns GUARDED_BY(mut);
+
+    void add(std::weak_ptr<Connection>);
+    void rm(Id connId);
+
+public:
+    /// Creates a new Connection object. `sock` should be an newly connected socket.
+    std::shared_ptr<Connection> CreateConnection(tcp::socket &&sock, bool inbound, Net net, std::string_view infoName);
 
     asio::io_context io_context{1};
-
-    void add(Connection *c);
-    void rm(Connection *c);
+    std::atomic_size_t nServers = 0u;
 
     bool haveInv_nolock(const uint256 &invHash) const SHARED_LOCKS_REQUIRED(mut) {
         return haveInvs.contains(invHash);
@@ -134,7 +180,7 @@ struct ConnMgr
     UniValue::Object GetStats() const;
 };
 
-class Connection
+class Connection : public std::enable_shared_from_this<Connection>
 {
     ConnMgr * const mgr;
     const Id id = GetNewId();
@@ -143,7 +189,7 @@ class Connection
     const bool inbound;
     const Net net;
     const ChainParams &params;
-    const std::string infoName;
+    std::string infoName;
     const uint64_t nLocalNonce;
     bitcoin::Tic tstart;
     bool disconnectRequested = false, pingerScheduled = false, cleanerScheduled = false;
@@ -169,9 +215,13 @@ class Connection
     [[nodiscard]] async<> SendVerACK(int nVersion = 0);
     [[nodiscard]] async<> Send(bitcoin::CSerializedNetMsg msg);
     template <typename ...Args>
-    [[nodiscard]] async<> Send(std::string_view msg_type, Args ...args) {
+    [[nodiscard]] async<> Send(int protocol_version, std::string_view msg_type, Args ...args) {
         using namespace bitcoin;
-        co_await Send(CNetMsgMaker(protoVersion).Make(msg_type, std::forward<Args>(args)...));
+        co_await Send(CNetMsgMaker(protocol_version).Make(msg_type, std::forward<Args>(args)...));
+    }
+    template <typename ...Args>
+    [[nodiscard]] async<> Send(std::string_view msg_type, Args ...args) {
+        co_await Send(protoVersion, msg_type, std::forward<Args>(args)...);
     }
 
     bitcoin::VectorReader MakeReader(const bitcoin::CSerializedNetMsg &msg, int protoFlags = 0, size_t pos = 0) const {
@@ -205,7 +255,7 @@ class Connection
         if (dtstr.back() == 'Z') dtstr.pop_back();
         dtstr += fmt::format(".{:06d}Z", nTimeMicros % 1'000'000);
         // this is a hack
-        return fmt::format("{} {} ({})", dtstr,
+        return fmt::format("{} {}{} ({})", dtstr, inbound ? "[inbound] " : "",
                            infoName.empty() ? remote.ToStringIPPort() : GetName(),
                            params.name);
     }
@@ -218,38 +268,38 @@ class Connection
     async<> CancelProcessing() {
         Debug("{}: Canceling processing ...\n", GetInfoStr());
         disconnectRequested = true;
-        Debug("{}: shutdown ...\n", GetInfoStr());
         asio::error_code ec;
-        sock.cancel(ec);
-        sock.shutdown(sock.shutdown_both);
         pinger.cancel(ec);
         cleaner.cancel(ec);
+        Debug("{}: shutdown ...\n", GetInfoStr());
+        sock.shutdown(sock.shutdown_both, ec);
         auto e = co_await this_coro::executor;
         asio::steady_timer t(e);
         t.expires_from_now(std::chrono::milliseconds{10});
         co_await t.async_wait(use_awaitable);
         Debug("{}: close ...\n", GetInfoStr());
-        sock.close();
+        sock.close(ec);
+        sock.cancel(ec);
     }
 
     void scheduleDisconnect() {
         if (!disconnectRequested) {
             disconnectRequested = true;
-            co_spawn(sock.get_executor(), CancelProcessing(), detached);
+            co_spawn_shared(*this, sock.get_executor(), CancelProcessing(), detached);
         }
     }
 
     void schedulePinger() {
         if (!pingerScheduled) {
             pingerScheduled = true;
-            co_spawn(sock.get_executor(), Pinger(), detached);
+            co_spawn_shared(*this, sock.get_executor(), Pinger(), detached);
         }
     }
 
     void scheduleCleaner() {
         if (!cleanerScheduled) {
             cleanerScheduled = true;
-            co_spawn(sock.get_executor(), Cleaner(), detached);
+            co_spawn_shared(*this, sock.get_executor(), Cleaner(), detached);
         }
     }
 
@@ -259,12 +309,13 @@ class Connection
 
     const uint256 & GetCheckpointHash() const { return params.mostRecentCheckpoint.second; }
 
-public:
-    Connection(ConnMgr *mgr, tcp::socket &&s_, bool inbound_, const Net net_, std::string infoName_ = {})
-        : mgr(mgr), sock(std::move(s_)), inbound(inbound_), net(net_), params(netChainParams.at(net)), infoName(std::move(infoName_)),
-          nLocalNonce(bitcoin::GetRand64()), pinger(sock.get_executor()), cleaner(sock.get_executor())
+protected:
+    friend ConnMgr;
+    Connection(ConnMgr *mgr, tcp::socket &&sock_, bool inbound_, Net net_, std::string_view infoName_)
+        : mgr(mgr), sock(std::move(sock_)), inbound(inbound_), net(net_), params(netChainParams.at(net)),
+          infoName(infoName_), nLocalNonce(bitcoin::GetRand64()), pinger(sock.get_executor()),
+          cleaner(sock.get_executor())
     {
-        mgr->add(this);
         bitcoin::CService srv;
         auto ep2srv = [](const tcp::endpoint &ep) {
             if (auto a = ep.address(); a.is_v4()) {
@@ -282,11 +333,15 @@ public:
                                   bitcoin::GetTime());
         srv = ep2srv(sock.remote_endpoint());
         remote = bitcoin::CAddress(srv, bitcoin::ServiceFlags::NODE_NONE, bitcoin::GetTime());
+        if (infoName.empty()) infoName = remote.ToStringIP();
     }
+
+public:
+    // NB: Use ConnMgr to Constructs a new instance (ensures it's wrapped in a shared_ptr)
 
     Connection(Connection &&) = delete;
 
-    ~Connection() { mgr->rm(this); }
+    ~Connection() { Debug("{}: ~Connection", GetInfoStr()); }
 
     [[nodiscard]]
     async<> ProcessLoop();
@@ -298,20 +353,40 @@ public:
     UniValue::Object GetStats() const;
 
     Id GetId() const { return id; }
+
+    bool IsInbound() const { return inbound; }
 };
 
-void ConnMgr::add(Connection *c) {
-    LOCK(mut);
-    auto const & [it, inserted] = conns.try_emplace(c->GetId(), c);
-    assert(inserted);
+std::shared_ptr<Connection> ConnMgr::CreateConnection(tcp::socket &&sock, bool inbound, Net net, std::string_view infoName = {})
+{
+    Connection *conn = new Connection(this, std::move(sock), inbound, net, infoName);
+    try {
+        std::shared_ptr<Connection> ret(conn, [this](Connection *c) { rm(c->GetId()); delete c; });
+        conn = nullptr;
+        add(ret);
+        return ret;
+    } catch (...) {
+        if (conn) delete conn;
+        throw;
+    }
 }
 
-void ConnMgr::rm(Connection *c) {
+void ConnMgr::add(std::weak_ptr<Connection> wc) {
+    auto c = wc.lock();
+    assert(bool(c));
     LOCK(mut);
-    auto const n = conns.erase(c->GetId());
-    assert(n != 0);
+    auto const & [it, inserted] = conns.try_emplace(c->GetId(), wc);
+    assert(inserted);
+    if (c->IsInbound()) ++nInbound;
+    else ++nOutbound;
+}
+
+void ConnMgr::rm(Id id) {
+    LOCK(mut);
+    auto const n = conns.erase(id);
+    assert(n > 0u);
     connsLost += n;
-    if (conns.empty()) {
+    if (conns.empty() && !nServers) {
         io_context.stop();
     }
 }
@@ -328,7 +403,7 @@ async<> Connection::SendVersion()
     const CAddress addrMe = CAddress(CService(), ServiceFlags(nLocalServices));
     sentVersion = true;
 
-    co_await Send(NetMsgType::VERSION, // cmd
+    co_await Send(INIT_PROTO_VERSION, NetMsgType::VERSION, // cmd
                   PROTOCOL_VERSION, nLocalServices, nTime, remote, addrMe, nLocalNonce, ver, nBestHeight, fRelayTxs); // data
 }
 
@@ -368,8 +443,11 @@ async<> Connection::Send(bitcoin::CSerializedNetMsg msg)
 async<> Connection::ProcessLoop()
 {
     tstart = bitcoin::Tic();
-    Log("{}: Connected\n", GetInfoStr());
-    Defer d([&] { Log("{}: ProcessLoop ended, {} secs elapsed\n", GetInfoStr(), tstart.secsStr(3)); });
+    Log("{}: Connection established\n", GetInfoStr());
+    Defer d([&] {
+        scheduleDisconnect();
+        Log("{}: ProcessLoop ended, {} secs elapsed\n", GetInfoStr(), tstart.secsStr(3));
+    });
     if (!inbound) {
         // first thing we must do is send the version
         co_await SendVersion();
@@ -532,14 +610,14 @@ async<> Connection::HandleVersion(bitcoin::CSerializedNetMsg && msg)
         vRecv >> this->relay;
     }
 
-           // Disconnect if we connected to self
+    // Disconnect if we connected to self
     if (nNonce && inbound && nNonce == nLocalNonce) {
         Warning("{}: connected to self, disconnecting\n", GetInfoStr());
         scheduleDisconnect();
         co_return;
     }
 
-           // only send version after we hear from them first, on inbound conns
+    // only send version after we hear from them first, on inbound conns
     if (inbound) {
         co_await SendVersion();
     }
@@ -572,6 +650,7 @@ async<> Connection::DoOnceIfAfterHandshake() {
         }
         co_await Send(NetMsgType::MEMPOOL); // testing!
         schedulePinger();
+        scheduleCleaner();
     }
 }
 
@@ -616,7 +695,7 @@ async<> Connection::HandlePong(bitcoin::CSerializedNetMsg && msg)
             if (nonce == lastPingNonceSent) {
                 lastPongTSMillis = GetTimeMillis();
                 lastPingPongDelta = lastPongTSMillis - lastPingTSMillis; // TODO: reject negative or 0 values here?
-                Debug("{}: Valid ping reply, measured latency: {:1.3f} msec\n", GetInfoStr(), lastPingPongDelta / 1e3);
+                Debug("{}: Valid ping reply, measured latency: {} msec\n", GetInfoStr(), lastPingPongDelta);
             } else {
                 problem = fmt::format("Ping reply nonce ({:x}) != what we expected ({:x})", nonce, lastPingNonceSent);
                 Warning("{}: {}", GetInfoStr(), problem);
@@ -767,6 +846,10 @@ async<> Connection::HandleHeaders(bitcoin::CSerializedNetMsg && msg)
         if (hdr.hashPrevBlock == GetCheckpointHash()) {
             didVerifyCheckPoint = true;
             Log("{}: Checkpoint at height {} verified", GetInfoStr(), GetCheckpointHeight());
+        } else {
+            auto problem = fmt::format("Checkpoint at height {} mismatch (expected: {}, got: {})",
+                                       GetCheckpointHeight(), GetCheckpointHash().ToString(), hdr.hashPrevBlock.ToString());
+            Misbehaving(100, problem);
         }
     }
 }
@@ -902,44 +985,71 @@ UniValue::Object Connection::GetStats() const
 UniValue::Object ConnMgr::GetStats() const
 {
     UniValue::Object ret;
-    ret.reserve(3);
+    ret.reserve(6);
     LOCK_SHARED(mut);
     ret.emplace_back("num_conns", conns.size());
     ret.emplace_back("num_lost_conns", connsLost);
+    ret.emplace_back("num_connected_inbound", nInbound.load());
+    ret.emplace_back("num_connected_outbound", nOutbound.load());
+    ret.emplace_back("num_bound_listen_ports", nServers.load());
     UniValue::Object uvconns;
     uvconns.reserve(conns.size());
-    for (auto const *c : conns | std::views::values) {
-        uvconns.emplace_back(c->GetName(), c->GetStats());
+    for (auto const &wc : conns | std::views::values) {
+        if (auto c = wc.lock())
+            uvconns.emplace_back(c->GetName(), c->GetStats());
     }
     ret.emplace_back("connections", std::move(uvconns));
     return ret;
 }
 
-async<> client(ConnMgr *mgr, Net net, std::string_view hostname, uint16_t port) {
-    auto portstr = fmt::format("{}", port);
-    auto executor = co_await this_coro::executor;
+async<> Client(ConnMgr *mgr, Net net, std::string_view hostname, uint16_t port) {
     for (;;) {
+        auto executor = co_await this_coro::executor;
         std::string excMsg;
         try {
             tcp::socket sock(executor);
             tcp::resolver rslv(executor);
-            Log("Connecting to {}:{} ...", hostname, portstr);
-            auto results = co_await rslv.async_resolve(hostname, portstr, use_awaitable);
+            Log("Connecting to {}:{} ...", hostname, port);
+            auto results = co_await rslv.async_resolve(hostname, fmt::format("{}", port), use_awaitable);
             if (results.empty()) throw std::runtime_error("Unable to resolve, no results");
             co_await asio::async_connect(sock, results, use_awaitable);
             if (!sock.is_open()) throw std::runtime_error("Socket not open");
-            Connection conn(mgr, std::move(sock), false, net, std::string{hostname});
-            co_await conn.ProcessLoop();
+            auto conn = mgr->CreateConnection(std::move(sock), false, net, std::string{hostname});
+            co_await conn->ProcessLoop();
         } catch (const std::exception &e) {
             excMsg = e.what();
         }
         if (!excMsg.empty())
-            Warning("{}:{}: Error: '{}' -- Will try again in 5 minutes ...", hostname, portstr, excMsg);
+            Warning("{}:{}: Error: '{}' -- Will try again in 5 minutes ...", hostname, port, excMsg);
         else
-            Warning("{}:{}: Connection lost, will try again in 5 minutes ...", hostname, portstr);
+            Warning("{}:{}: Connection lost, will try again in 5 minutes ...", hostname, port);
         asio::steady_timer timer(executor);
         timer.expires_from_now(std::chrono::minutes{5});
         co_await timer.async_wait(use_awaitable);
+    }
+}
+
+async<> Server(ConnMgr *mgr, Net net, std::string_view iface, uint16_t port) {
+    asio::ip::address addr;
+    std::error_code ec;
+    addr = asio::ip::make_address_v4(iface, ec);
+    if (ec) addr = asio::ip::make_address_v6(iface, ec);
+    if (ec) throw std::invalid_argument(fmt::format("Bad interface string: {}", iface));
+    auto executor = co_await this_coro::executor;
+    tcp::acceptor acceptor(executor, {addr, port});
+    const std::string hostPort = fmt::format("{}:{}", iface, port);
+    Log("Listening on {} ({}) ...", hostPort, Net2Name(net));
+    ++mgr->nServers;
+    Defer d([&]{ --mgr->nServers; });
+    for (;;) {
+        auto socket = co_await acceptor.async_accept(use_awaitable);
+        if (socket.is_open()) {
+            auto ep = socket.remote_endpoint();
+            Log("Inbound connection from {}:{} (interface: {}) ...", ep.address().to_string(), ep.port(), hostPort);
+            executor = co_await this_coro::executor;
+            auto conn = mgr->CreateConnection(std::move(socket), true, net);
+            co_spawn_shared(*conn, executor, conn->ProcessLoop(), detached);
+        }
     }
 }
 
@@ -948,10 +1058,139 @@ void printStats(const ConnMgr &mgr)
     Log("\n--- Stats:\n{}\n", styled(UniValue::stringify(mgr.GetStats(), 2), fg(Color::green)|bg(Color::black)|fmt::emphasis::bold));
 }
 
-int main() {
+struct ParsedArgs
+{
+    using Tup = std::tuple<Net, std::string, uint16_t>;
+    using VecTup = std::vector<Tup>;
+
+    VecTup connectToHosts;
+    VecTup serverBinds;
+
+    static Tup ParseHostPortNet(std::string_view arg);
+};
+
+/* static */
+auto ParsedArgs::ParseHostPortNet(std::string_view const orig_arg) -> Tup
+{
+    std::string arg{orig_arg};
+    std::string host;
+    auto ThrowIfEmptyHost = [&orig_arg, &host] {
+        if (host.empty()) throw std::runtime_error(fmt::format("Empty host in arg: {}", orig_arg));
+    };
+    size_t min_parts = 2, max_parts = 3;
+    // first match ipv6 if any, because it contains colons and that can mess us up
+    if (size_t pos; !arg.empty() && arg[0] == '[' && (pos = arg.find_last_of(']')) != arg.npos) {
+        host = arg.substr(1, pos - 1);
+        ThrowIfEmptyHost();
+        --min_parts, --max_parts;
+        arg.erase(0, pos + 2);
+    }
+    std::deque<std::string> parts;
+    boost::algorithm::split(parts, arg, boost::is_any_of(":"));
+    if (parts.size() < min_parts || parts.size() > max_parts) {
+        throw std::runtime_error(fmt::format("Bad argument: {}", orig_arg));
+    }
+    // accept host
+    if (host.empty()) {
+        host = std::move(parts.front());
+        ThrowIfEmptyHost();
+        parts.pop_front();
+    }
+    // parse port
+    uint16_t port;
+    if (auto *beg = &*parts.front().begin(), *end = &*parts.front().end();
+        beg == end || std::from_chars(beg, end, port).ptr != end) {
+        throw std::runtime_error(fmt::format("Bad port for argument: {}", orig_arg));
+    }
+    // accept port
+    parts.pop_front();
+
+    // parse optional Net part at end
+    Net net = Net::Main;
+    if (!parts.empty()) {
+        // parse last net arg
+        auto res = Name2Net(parts.front());
+        if (!res) throw std::runtime_error(fmt::format("Bad net for argument: {}", orig_arg));
+        net = *res;
+        parts.pop_front();
+    }
+    Debug("Parsed '{}' -> net: {}, host: {}, port: {}", orig_arg, Net2Name(net), host, port);
+    return {net, host, port};
+}
+
+ParsedArgs parseArgs(int argc, const char **argv)
+{
+    using Tup = ParsedArgs::Tup;
+
+    std::array const defaultConnect = {
+        Tup{Main, "localhost", 8888}, // this should error
+        Tup{Main, "thisshouldfail.google.com", 8888}, // this should error
+        Tup{Main, "c3.c3-soft.com", 8333},
+        Tup{Chip, "c3.c3-soft.com", 48333},
+        Tup{Main, "bch.loping.net", 8333},
+        Tup{Main, "tbch.loping.net", 18333}, // this is wrong -- testing error case
+        Tup{Scale, "sbch.loping.net", 38333},
+        Tup{Reg, "localhost", 9333}, // our regtest node.. should normally fail but maybe is up sometimes
+    };
+
+    ParsedArgs ret;
+    using namespace argparse;
+    ArgumentParser ap(argv[0], VERSION_STR);
+
+    ap.add_argument("connect")
+        .help("Peer spec to connect to").metavar("HOST:PORT[:NET]")
+        .nargs(nargs_pattern::any)
+        .append();
+
+    ap.add_argument("--listen")
+        .help("Bind to this interface and port to listen for connections").metavar("INTERFACE:PORT[:NET]")
+        .nargs(nargs_pattern::any)
+        .append();
+
+    using namespace boost;
+    std::string const netlist = algorithm::join(
+        netChainParams | adaptors::transformed([](const auto &cp) { return boost::algorithm::to_lower_copy(std::string{cp.name}); }),
+        ", "
+    );
+
+    ap.add_epilog("Notes:\n"
+                  " - All IPv6 addresses whould be in brackets, e.g. [::1]\n"
+                  " - HOST above may be a hostname or an IP address\n"
+                  " - INTERFACE above must be a valid local interface IP address\n"
+                  " - NET above is one of: " + netlist);
+
+    try {
+        ap.parse_args(argc, argv);
+
+        if (ap.is_used("connect")) {
+            for (const auto &arg : ap.get<std::vector<std::string>>("connect")) {
+                ret.connectToHosts.push_back(ParsedArgs::ParseHostPortNet(arg));
+            }
+        }
+        if (ap.is_used("listen")) {
+            for (const auto &arg : ap.get<std::vector<std::string>>("listen")) {
+                ret.serverBinds.push_back(ParsedArgs::ParseHostPortNet(arg));
+            }
+        }
+    } catch (const std::exception &e) {
+        std::cout << e.what() << "\n";
+        std::exit(EXIT_FAILURE);
+    }
+
+    if (ret.connectToHosts.empty() && ret.serverBinds.empty())
+        ret.connectToHosts = {defaultConnect.begin(), defaultConnect.end()};
+
+    return ret;
+}
+
+} // namespace
+
+int main(int argc, const char *argv[]) {
     Debug::enabled = true;
     bitcoin::LogInstance().m_log_timestamps = bitcoin::LogInstance().m_log_time_micros = true;
     std::signal(SIGPIPE, SIG_IGN); // required to avoid SIGPIPE when write()/read()
+
+    auto const & [connectToHosts, serverBinds] = parseArgs(argc, argv);
 
     bitcoin::RandomInit();
     if (!bitcoin::Random_SanityCheck()) fmt::print(stderr, "{}", styled("WARNING: Random_SanityCheck failed!", fg(fmt::terminal_color::bright_yellow) | fmt::emphasis::bold));
@@ -983,32 +1222,26 @@ int main() {
 
         size_t errct = 0;
 
-        using HP = std::tuple<Net, std::string_view, uint16_t>;
-        std::array hp = {
-            HP{Main, "localhost", 8888}, // this should error
-            HP{Main, "thisshouldfail.google.com", 8888}, // this should error
-            HP{Main, "c3.c3-soft.com", 8333},
-            HP{Chip, "c3.c3-soft.com", 48333},
-            HP{Main, "bch.loping.net", 8333},
-            HP{Main, "tbch.loping.net", 18333}, // this is wrong -- testing error case
-            HP{Scale, "sbch.loping.net", 38333},
-            HP{Reg, "localhost", 9333}, // our regtest node.. should normally fail but maybe is up sometimes
-        };
-
-        auto handler = [&](std::string_view host, uint16_t port, std::exception_ptr exc) {
+        auto handler = [&](std::string_view host, uint16_t port, std::exception_ptr exc, bool is_server=false) {
             if (exc) {
                 try {
                     std::rethrow_exception(exc);
                 } catch (const std::exception &e) {
-                    if (++errct == hp.size())
+                    if (is_server || ++errct == connectToHosts.size())
                         throw;
                     Warning("{}:{}: Exception: {}", host, port, e.what());
                 }
             }
         };
 
-        for (const auto & [net, host, port] : hp) {
-            co_spawn(io_context, client(&mgr, net, host, port), [&handler, host, port](auto exc) { handler(host, port, exc); });
+        for (const auto & [net, host, port] : connectToHosts) {
+            co_spawn(io_context, Client(&mgr, net, host, port),
+                     [&handler, host, port](auto exc) { handler(host, port, exc); });
+        }
+
+        for (const auto & [net, host, port] : serverBinds) {
+            co_spawn(io_context, Server(&mgr, net, host, port),
+                     [&handler, host, port](auto exc) { handler(host, port, exc, true); });
         }
 
         io_context.run();
