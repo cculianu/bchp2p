@@ -27,19 +27,19 @@ find_package(Boost 1.71.0 REQUIRED)
 # UniValue
 set(BUILD_BENCH OFF CACHE INTERNAL "Used by UniValue, disabled" FORCE)
 set(BUILD_TESTS OFF CACHE INTERNAL "Used by UniValue, disabled" FORCE)
-add_subdirectory(univalue)
+add_subdirectory(src/univalue)
 target_compile_options(univalue PRIVATE -Wall -Wno-unused-parameter)
 
 # BCHN modified sources, as a lib
 add_library(bitcoin
-    bitcoin/amount.cpp bitcoin/base58.cpp bitcoin/block.cpp bitcoin/bloom.cpp bitcoin/cashaddr.cpp bitcoin/cashaddrenc.cpp
-    bitcoin/crypto/aes.cpp bitcoin/crypto/chacha20.cpp bitcoin/crypto/hmac_sha256.cpp bitcoin/crypto/hmac_sha512.cpp
-    bitcoin/crypto/ripemd160.cpp bitcoin/crypto/sha1.cpp bitcoin/crypto/sha256.cpp bitcoin/crypto/sha256_sse4.cpp
-    bitcoin/crypto/sha3.cpp bitcoin/crypto/sha512.cpp bitcoin/crypto/siphash.cpp bitcoin/feerate.cpp bitcoin/hash.cpp
-    bitcoin/interpreter.cpp bitcoin/logging.cpp bitcoin/netaddress.cpp bitcoin/protocol.cpp bitcoin/pubkey.cpp
-    bitcoin/random.cpp bitcoin/script.cpp bitcoin/script_error.cpp bitcoin/script_standard.cpp bitcoin/sigencoding.cpp
-    bitcoin/token.cpp bitcoin/transaction.cpp bitcoin/uint256.cpp bitcoin/utilsaltedhashers.cpp
-    bitcoin/utilstrencodings.cpp bitcoin/utilthreadnames.cpp bitcoin/utiltime.cpp
+    src/bitcoin/amount.cpp src/bitcoin/base58.cpp src/bitcoin/block.cpp src/bitcoin/bloom.cpp src/bitcoin/cashaddr.cpp src/bitcoin/cashaddrenc.cpp
+    src/bitcoin/crypto/aes.cpp src/bitcoin/crypto/chacha20.cpp src/bitcoin/crypto/hmac_sha256.cpp src/bitcoin/crypto/hmac_sha512.cpp
+    src/bitcoin/crypto/ripemd160.cpp src/bitcoin/crypto/sha1.cpp src/bitcoin/crypto/sha256.cpp src/bitcoin/crypto/sha256_sse4.cpp
+    src/bitcoin/crypto/sha3.cpp src/bitcoin/crypto/sha512.cpp src/bitcoin/crypto/siphash.cpp src/bitcoin/feerate.cpp src/bitcoin/hash.cpp
+    src/bitcoin/interpreter.cpp src/bitcoin/logging.cpp src/bitcoin/netaddress.cpp src/bitcoin/protocol.cpp src/bitcoin/pubkey.cpp
+    src/bitcoin/random.cpp src/bitcoin/script.cpp src/bitcoin/script_error.cpp src/bitcoin/script_standard.cpp src/bitcoin/sigencoding.cpp
+    src/bitcoin/token.cpp src/bitcoin/transaction.cpp src/bitcoin/uint256.cpp src/bitcoin/utilsaltedhashers.cpp
+    src/bitcoin/utilstrencodings.cpp src/bitcoin/utilthreadnames.cpp src/bitcoin/utiltime.cpp
 )
 
 target_compile_definitions(bitcoin PRIVATE USE_ASM)
@@ -52,12 +52,12 @@ target_link_libraries(bitcoin fmt::fmt)
 # /BCHN
 
 # Testing echoserver using asio
-add_executable(asiotest asiotest.cpp util.cpp)
+add_executable(asiotest src/asiotest.cpp src/util.cpp)
 target_compile_options(asiotest PRIVATE -Wall -Wno-unused-parameter)
 target_link_libraries(asiotest fmt::fmt asio::asio univalue bitcoin)
 
 # bchp2p using asio
-add_executable(bchp2p bchp2p.cpp util.cpp)
+add_executable(bchp2p src/bchp2p.cpp src/util.cpp)
 target_compile_options(bchp2p PRIVATE -Wall -Wno-unused-parameter)
 target_link_libraries(bchp2p fmt::fmt asio::asio Boost::boost univalue bitcoin)
 
