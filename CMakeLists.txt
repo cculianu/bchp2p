@@ -24,6 +24,13 @@ find_package(asio REQUIRED)
 # Boost
 find_package(Boost 1.71.0 REQUIRED)
 
+# Simple Web Server
+set(USE_STANDALONE_ASIO ON CACHE INTERNAL "Used by Simple-Web-Server, disabled" FORCE)
+set(BUILD_TESTING OFF CACHE INTERNAL "Used by Simple-Web-Server, disabled" FORCE)
+set(BUILD_FUZZING OFF CACHE INTERNAL "Used by Simple-Web-Server, disabled" FORCE)
+set(USE_OPENSSL OFF CACHE INTERNAL "Used by Simple-Web-Server, disabled" FORCE)
+add_subdirectory(Simple-Web-Server)
+
 # UniValue
 set(BUILD_BENCH OFF CACHE INTERNAL "Used by UniValue, disabled" FORCE)
 set(BUILD_TESTS OFF CACHE INTERNAL "Used by UniValue, disabled" FORCE)
@@ -57,9 +64,9 @@ target_compile_options(asiotest PRIVATE -Wall -Wno-unused-parameter)
 target_link_libraries(asiotest fmt::fmt asio::asio univalue bitcoin)
 
 # bchp2p using asio
-add_executable(bchp2p src/bchp2p.cpp src/util.cpp)
+add_executable(bchp2p src/bchp2p.cpp src/util.cpp src/html_bits.cpp)
 target_compile_options(bchp2p PRIVATE -Wall -Wno-unused-parameter)
-target_link_libraries(bchp2p fmt::fmt asio::asio Boost::boost univalue bitcoin)
+target_link_libraries(bchp2p fmt::fmt asio::asio Boost::boost univalue bitcoin simple-web-server)
 
 add_compile_definitions(VERSION_STR=\"${CMAKE_PROJECT_VERSION}\")
 

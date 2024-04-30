@@ -12,12 +12,14 @@
 #include "bitcoin/utiltime.h"
 
 #include "argparse.hpp"
+#include "html_bits.h"
 #include "util.h"
 
 #include <asio.hpp>
 #include <boost/algorithm/string.hpp>
 #include <boost/range/adaptors.hpp>
 #include <fmt/format.h>
+#include <server_http.hpp>
 #include <univalue.h>
 
 #include <atomic>
@@ -146,7 +148,7 @@ public:
     /// Creates a new Connection object. `sock` should be an newly connected socket.
     std::shared_ptr<Connection> CreateConnection(tcp::socket &&sock, bool inbound, Net net, std::string_view infoName);
 
-    asio::io_context io_context{1};
+    std::shared_ptr<asio::io_context> io_context = std::make_shared<asio::io_context>(1);
     std::atomic_size_t nServers = 0u;
 
     bool haveInv_nolock(const uint256 &invHash) const SHARED_LOCKS_REQUIRED(mut) {
@@ -357,15 +359,11 @@ public:
 std::shared_ptr<Connection> ConnMgr::CreateConnection(tcp::socket &&sock, bool inbound, Net net, std::string_view infoName = {})
 {
     Connection *conn = new Connection(this, std::move(sock), inbound, net, infoName);
-    try {
-        std::shared_ptr<Connection> ret(conn, [this](Connection *c) { rm(c->GetId()); delete c; });
-        conn = nullptr;
-        add(ret);
-        return ret;
-    } catch (...) {
-        if (conn) delete conn;
-        throw;
-    }
+    Defer d([&conn] { if (conn) { delete conn; conn = nullptr; } }); // ensure `conn` doesn't leak on exception
+    std::shared_ptr<Connection> ret(conn, [this](Connection *c) { rm(c->GetId()); delete c; });
+    conn = nullptr;
+    add(ret);
+    return ret;
 }
 
 void ConnMgr::add(std::weak_ptr<Connection> wc) {
@@ -384,7 +382,7 @@ void ConnMgr::rm(Id id) {
     assert(n > 0u);
     connsLost += n;
     if (conns.empty() && !nServers) {
-        io_context.stop();
+        io_context->stop();
     }
 }
 
@@ -999,7 +997,7 @@ UniValue::Object ConnMgr::GetStats() const
     return ret;
 }
 
-async<> Client(ConnMgr *mgr, Net net, std::string_view hostname, uint16_t port) {
+async<> Client(ConnMgr &mgr, Net net, std::string_view hostname, uint16_t port) {
     for (;;) {
         auto executor = co_await this_coro::executor;
         std::string excMsg;
@@ -1011,7 +1009,7 @@ async<> Client(ConnMgr *mgr, Net net, std::string_view hostname, uint16_t port) 
             if (results.empty()) throw std::runtime_error("Unable to resolve, no results");
             co_await asio::async_connect(sock, results, use_awaitable);
             if (!sock.is_open()) throw std::runtime_error("Socket not open");
-            auto conn = mgr->CreateConnection(std::move(sock), false, net, std::string{hostname});
+            auto conn = mgr.CreateConnection(std::move(sock), false, net, std::string{hostname});
             co_await conn->ProcessLoop();
         } catch (const std::exception &e) {
             excMsg = e.what();
@@ -1026,7 +1024,7 @@ async<> Client(ConnMgr *mgr, Net net, std::string_view hostname, uint16_t port) 
     }
 }
 
-async<> Server(ConnMgr *mgr, Net net, std::string_view iface, uint16_t port) {
+async<> Server(ConnMgr &mgr, Net net, std::string_view iface, uint16_t port) {
     asio::ip::address addr;
     std::error_code ec;
     addr = asio::ip::make_address_v4(iface, ec);
@@ -1036,15 +1034,15 @@ async<> Server(ConnMgr *mgr, Net net, std::string_view iface, uint16_t port) {
     tcp::acceptor acceptor(executor, {addr, port});
     const std::string hostPort = fmt::format("{}:{}", iface, port);
     Log("Listening on {} ({}) ...", hostPort, Net2Name(net));
-    ++mgr->nServers;
-    Defer d([&]{ --mgr->nServers; });
+    ++mgr.nServers;
+    Defer d([&]{ --mgr.nServers; });
     for (;;) {
         auto socket = co_await acceptor.async_accept(use_awaitable);
         if (socket.is_open()) {
             auto ep = socket.remote_endpoint();
             Log("Inbound connection from {}:{} (interface: {}) ...", ep.address().to_string(), ep.port(), hostPort);
             executor = co_await this_coro::executor;
-            auto conn = mgr->CreateConnection(std::move(socket), true, net);
+            auto conn = mgr.CreateConnection(std::move(socket), true, net);
             co_spawn_shared(*conn, executor, conn->ProcessLoop(), detached);
         }
     }
@@ -1062,19 +1060,47 @@ struct ParsedArgs
 
     VecTup connectToHosts;
     VecTup serverBinds;
+    std::optional<std::string> httpServerInterface;
+    std::optional<uint16_t> httpServerPort;
 
-    static Tup ParseHostPortNet(std::string_view arg);
+    static Tup ParseHostPortNet(std::string_view s) { return ParseHostPortNetCommon(s, true); }
+    static auto ParseHostPort(std::string_view s) {
+        std::pair<std::string, uint16_t> ret;
+        std::tie(std::ignore, ret.first, ret.second) = ParseHostPortNetCommon(s, false);
+        return ret;
+    }
+
+    static uint16_t ParsePort(std::string_view s, std::optional<std::string_view> orig_arg = {});
+
+private:
+    static Tup ParseHostPortNetCommon(std::string_view arg, bool acceptNetPart);
 };
 
 /* static */
-auto ParsedArgs::ParseHostPortNet(std::string_view const orig_arg) -> Tup
+uint16_t ParsedArgs::ParsePort(std::string_view s, std::optional<std::string_view> orig_arg)
+{
+    uint16_t port;
+    std::from_chars_result res;
+    constexpr const auto ok = std::errc{};
+    if (auto *beg = &*s.begin(), *end = &*s.end();
+        beg == end || (res = std::from_chars(beg, end, port)).ptr != end || res.ec != ok) {
+        throw std::runtime_error(fmt::format("Bad port ({}) for argument: {}",
+                                             std::make_error_code(res.ec == ok ? std::errc::invalid_argument : res.ec)
+                                                 .message(),
+                                             orig_arg.value_or(s)));
+    }
+    return port;
+}
+
+/* static */
+auto ParsedArgs::ParseHostPortNetCommon(std::string_view const orig_arg, bool const acceptNetPart) -> Tup
 {
     std::string arg{orig_arg};
     std::string host;
     auto ThrowIfEmptyHost = [&orig_arg, &host] {
         if (host.empty()) throw std::runtime_error(fmt::format("Empty host in arg: {}", orig_arg));
     };
-    size_t min_parts = 2, max_parts = 3;
+    size_t min_parts = 2, max_parts = 2 + acceptNetPart;
     // first match ipv6 if any, because it contains colons and that can mess us up
     if (size_t pos; !arg.empty() && arg[0] == '[' && (pos = arg.find_last_of(']')) != arg.npos) {
         host = arg.substr(1, pos - 1);
@@ -1093,12 +1119,8 @@ auto ParsedArgs::ParseHostPortNet(std::string_view const orig_arg) -> Tup
         ThrowIfEmptyHost();
         parts.pop_front();
     }
-    // parse port
-    uint16_t port;
-    if (auto *beg = &*parts.front().begin(), *end = &*parts.front().end();
-        beg == end || std::from_chars(beg, end, port).ptr != end) {
-        throw std::runtime_error(fmt::format("Bad port for argument: {}", orig_arg));
-    }
+    // parse port (may throw)
+    uint16_t const port = ParsePort(parts.front(), orig_arg);
     // accept port
     parts.pop_front();
 
@@ -1111,7 +1133,8 @@ auto ParsedArgs::ParseHostPortNet(std::string_view const orig_arg) -> Tup
         net = *res;
         parts.pop_front();
     }
-    Debug("Parsed '{}' -> net: {}, host: {}, port: {}", orig_arg, Net2Name(net), host, port);
+    Debug("Parsed '{}' -> {}host: {}, port: {}", orig_arg, acceptNetPart ? fmt::format("net: {}, ", Net2Name(net)) : "",
+          host, port);
     return {net, host, port};
 }
 
@@ -1144,6 +1167,10 @@ ParsedArgs parseArgs(int argc, const char **argv)
         .nargs(nargs_pattern::any)
         .append();
 
+    ap.add_argument("--http", "-H")
+        .help("Start the info http server on this interface and port (0 to disable)").metavar("[INTERFACE:]PORT")
+        .default_value("127.0.0.1:8080");
+
     using namespace boost;
     std::string const netlist = algorithm::join(
         netChainParams | adaptors::transformed([](const auto &cp) { return boost::algorithm::to_lower_copy(std::string{cp.name}); }),
@@ -1169,6 +1196,14 @@ ParsedArgs parseArgs(int argc, const char **argv)
                 ret.serverBinds.push_back(ParsedArgs::ParseHostPortNet(arg));
             }
         }
+
+        // --http / -H
+        auto const pstr = ap.get("http");
+        if (pstr.find(':') != pstr.npos) {
+            std::tie(ret.httpServerInterface, ret.httpServerPort) = ParsedArgs::ParseHostPort(pstr);
+        } else if (uint16_t const p = ParsedArgs::ParsePort(pstr)) {
+            ret.httpServerPort = p;
+        }
     } catch (const std::exception &e) {
         std::cerr << e.what() << "\n";
         std::exit(EXIT_FAILURE);
@@ -1180,6 +1215,48 @@ ParsedArgs parseArgs(int argc, const char **argv)
     return ret;
 }
 
+using HttpServer = SimpleWeb::Server<SimpleWeb::HTTP>;
+std::unique_ptr<HttpServer> StartHttpServer(ConnMgr &mgr, const std::string_view address, const uint16_t port)
+{
+    auto httpSrv = std::make_unique<HttpServer>();
+    httpSrv->config.address = address;
+    httpSrv->config.port = port;
+    httpSrv->config.max_request_streambuf_size = 1<<16; // 64 KiB; change this if we expect larger requests
+    httpSrv->io_service = mgr.io_context;
+    httpSrv->resource["/.*"]["GET"] = [&mgr](auto response, auto request) {
+        Debug(Color::bright_blue, "HTTP: {} request \"{}\"", request->method, request->path);
+        constexpr bool debug_incoming_headers = false;
+        if constexpr (debug_incoming_headers) {
+            for (const auto & [key, value] : request->header) {
+                Debug(Color::bright_black, "{}: {}", key, value);
+            }
+        }
+        if (request->path.ends_with("favicon.ico")) {
+            // reject browser favicon.ico.. grr
+            response->write(SimpleWeb::StatusCode::client_error_not_found);
+            Debug(Color::bright_black, "HTTP: not found for \"{}\"", request->path);
+            return;
+        }
+        // else.. every other /path
+        const auto html = html_bits::MakePrettyHtmlForJson("BCH P2P Program Stats", mgr.GetStats());
+        response->write(html, {{"Content-type", "text/html"}});
+    };
+    httpSrv->on_error = [](auto req, auto err) {
+        auto const ep = req->remote_endpoint();
+        auto const hostport = ep == decltype(ep){} ? "<lost_conn>" : fmt::format("{}:{}", ep.address().to_string(), ep.port());
+        Debug(Color::bright_black, "Error from {}: {}", hostport, err.message());
+    };
+    try {
+        httpSrv->start([](auto port){ Log("HTTP service started ok, port {}", port); });
+    } catch (const std::exception &e) {
+        auto msg = fmt::format("Failed to start HTTP server on {}{}{} ({})",
+                               address.empty() ? "port " : address, address.empty() ? "" : ":",
+                               port, e.what());
+        throw std::runtime_error(msg);
+    }
+    return httpSrv;
+}
+
 } // namespace
 
 int main(int argc, const char *argv[]) {
@@ -1189,14 +1266,14 @@ int main(int argc, const char *argv[]) {
     bitcoin::LogInstance().m_log_threadnames = true;
     std::signal(SIGPIPE, SIG_IGN); // required to avoid SIGPIPE when write()/read()
 
-    auto const & [connectToHosts, serverBinds] = parseArgs(argc, argv); // may exit prematurely if --help, --version, or bad args
+    auto const & [connectToHosts, serverBinds, httpInterface, httpPort] = parseArgs(argc, argv); // may exit prematurely if --help, --version, or bad args
 
     bitcoin::RandomInit();
     if (!bitcoin::Random_SanityCheck()) fmt::print(stderr, "{}", styled("WARNING: Random_SanityCheck failed!", fg(fmt::terminal_color::bright_yellow) | fmt::emphasis::bold));
 
     try {
         ConnMgr mgr;
-        asio::io_context & io_context = mgr.io_context;
+        asio::io_context & io_context = *mgr.io_context;
 
         asio::signal_set signals(io_context, SIGINT, SIGTERM, SIGUSR1);
         signals.add(SIGQUIT);
@@ -1234,13 +1311,21 @@ int main(int argc, const char *argv[]) {
         };
 
         for (const auto & [net, host, port] : connectToHosts) {
-            co_spawn(io_context, Client(&mgr, net, host, port),
+            co_spawn(io_context, Client(mgr, net, host, port),
                      [&handler, host, port](auto exc) { handler(host, port, exc); });
         }
 
         for (const auto & [net, host, port] : serverBinds) {
-            co_spawn(io_context, Server(&mgr, net, host, port),
+            co_spawn(io_context, Server(mgr, net, host, port),
                      [&handler, host, port](auto exc) { handler(host, port, exc, true); });
+        }
+
+        // Handle HTTP on whatever host & port the user specified, or default to port 8080
+        std::unique_ptr<HttpServer> httpSrv;
+        if (httpPort.has_value()) {
+            httpSrv = StartHttpServer(mgr, httpInterface.value_or(std::string{} /* any */), *httpPort);
+        } else {
+            Debug("HTTP service disabled");
         }
 
         io_context.run();
