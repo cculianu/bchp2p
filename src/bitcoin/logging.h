@@ -6,7 +6,7 @@
 
 #pragma once
 
-#include <fmt/format.h>
+#include "tinyformat.h"
 
 #include <atomic>
 #include <cstdint>
@@ -14,6 +14,7 @@
 #include <list>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -151,17 +152,17 @@ bool GetLogCategory(BCLog::LogFlags &flag, const std::string &str);
 // unconditionally log to debug.log! It should not be the case that an inbound
 // peer can fill up a user's disk with debug.log entries.
 template <typename... Args>
-static inline void LogPrintf(const char *fmtstr, const Args &... args) {
+static inline void LogPrintf(std::string_view fmtstr, Args &&... args) {
     if (LogInstance().Enabled()) {
         std::string log_msg;
         try {
-            log_msg = fmt::format(fmt::runtime(fmtstr), args...);
+            log_msg = strprintf(fmtstr, std::forward<Args>(args)...);
         } catch (const std::runtime_error &fmterr) {
             /**
              * Original format string will have newline so don't add one here
              */
             log_msg = "Error \"" + std::string(fmterr.what()) +
-                      "\" while formatting log message: " + fmtstr;
+                      "\" while formatting log message: " + std::string{fmtstr};
         }
         LogInstance().LogPrintStr(std::move(log_msg));
     }

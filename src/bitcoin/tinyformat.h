@@ -1,11 +1,12 @@
 #pragma once
 #include <fmt/printf.h>
 
+#include <string_view>
 #include <utility>
 
 namespace bitcoin {
 
 template <typename ...Args>
-auto strprintf(Args &&...args) { return fmt::sprintf(std::forward<Args>(args)...); }
+auto strprintf(std::string_view fmt, Args &&...args) { return fmt::sprintf(fmt, std::forward<Args>(args)...); }
 
 } // namespace bitcoin

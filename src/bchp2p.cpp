@@ -8,6 +8,7 @@
 #include "bitcoin/sync.h"
 #include "bitcoin/random.h"
 #include "bitcoin/utilstrencodings.h"
+#include "bitcoin/utilthreadnames.h"
 #include "bitcoin/utiltime.h"
 
 #include "argparse.hpp"
@@ -250,12 +251,8 @@ class Connection : public std::enable_shared_from_this<Connection>
     [[nodiscard]] async<> Cleaner(); // periodically does cleanup
 
     std::string GetInfoStr() const {
-        const int64_t nTimeMicros = bitcoin::GetTimeMicros();
-        std::string dtstr = bitcoin::FormatISO8601DateTime(nTimeMicros / 1'000'000);
-        if (dtstr.back() == 'Z') dtstr.pop_back();
-        dtstr += fmt::format(".{:06d}Z", nTimeMicros % 1'000'000);
         // this is a hack
-        return fmt::format("{} {}{} ({})", dtstr, inbound ? "[inbound] " : "",
+        return fmt::format("{}{} ({})", inbound ? "[inbound] " : "",
                            infoName.empty() ? remote.ToStringIPPort() : GetName(),
                            params.name);
     }
@@ -1186,8 +1183,10 @@ ParsedArgs parseArgs(int argc, const char **argv)
 } // namespace
 
 int main(int argc, const char *argv[]) {
+    bitcoin::util::ThreadSetInternalName("M");
     Debug::enabled = true;
     bitcoin::LogInstance().m_log_timestamps = bitcoin::LogInstance().m_log_time_micros = true;
+    bitcoin::LogInstance().m_log_threadnames = true;
     std::signal(SIGPIPE, SIG_IGN); // required to avoid SIGPIPE when write()/read()
 
     auto const & [connectToHosts, serverBinds] = parseArgs(argc, argv);

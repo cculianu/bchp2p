@@ -48,8 +48,8 @@ public:
 
     ~Log();
 
-    Log(Log &&o) noexcept : os{std::move(o.os)}, en{o.en}, ots{o.ots} { o.en = false; }
-    Log &operator=(Log &&o) noexcept { os.swap(o.os);  en = o.en; ots = o.ots; o.en = false; return *this; }
+    Log(Log &&o) noexcept : os{std::move(o.os)}, en{o.en}, ots{std::move(o.ots)} { o.en = false; }
+    Log &operator=(Log &&o) noexcept { os.swap(o.os);  en = o.en; ots = std::move(o.ots); o.en = false; return *this; }
 
     // Note: This style may be slower (if repeatedly called) than simply formatting with a format string
     template <typename T>
