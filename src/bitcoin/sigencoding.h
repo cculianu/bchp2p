@@ -12,11 +12,6 @@
 #include <cstdint>
 #include <vector>
 
-#ifdef __clang__
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wunused-function"
-#endif
-
 namespace bitcoin {
 
 using valtype = std::vector<uint8_t>;
@@ -70,8 +65,3 @@ bool CheckPubKeyEncoding(const valtype &vchPubKey, uint32_t flags,
                          ScriptError *serror);
 
 } // end namespace bitcoin
-
-
-#ifdef __clang__
-#pragma clang diagnostic pop
-#endif

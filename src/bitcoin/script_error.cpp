@@ -5,11 +5,6 @@
 
 #include "script_error.h"
 
-#ifdef __clang__
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wcovered-switch-default"
-#endif
-
 namespace bitcoin {
 
 const char *ScriptErrorString(const ScriptError serror) {
@@ -132,7 +127,3 @@ const char *ScriptErrorString(const ScriptError serror) {
 }
 
 } // end namespace bitcoin
-
-#ifdef __clang__
-#pragma clang diagnostic pop
-#endif

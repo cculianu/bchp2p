@@ -16,12 +16,6 @@
 #include <QtCore>
 #endif
 
-#ifdef __clang__
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wconversion"
-#pragma clang diagnostic ignored "-Wcovered-switch-default"
-#endif
-
 namespace bitcoin {
 
 /// convenient work-alike added by Calin
@@ -239,7 +233,3 @@ std::vector<uint8_t> PackCashAddrContent(const CashAddrContent &content) {
 }
 
 } // end namespace bitcoin
-
-#ifdef __clang__
-#pragma clang diagnostic pop
-#endif

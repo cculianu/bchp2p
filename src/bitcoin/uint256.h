@@ -11,13 +11,6 @@
 #include <string>
 #include <vector>
 
-[[maybe_unused]] inline constexpr int xxx_to_suppress_warning_2{}; // without this the below sometimes warns
-#ifdef __clang__
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wold-style-cast"
-#pragma clang diagnostic ignored "-Wundefined-func-template"
-#endif
-
 namespace bitcoin {
 
 /** Template base class for fixed-sized opaque blobs. */
@@ -181,7 +174,3 @@ inline uint160 uint160S(const std::string &str) noexcept {
 }
 
 } // end namespace bitcoin
-
-#ifdef __clang__
-#pragma clang diagnostic pop
-#endif

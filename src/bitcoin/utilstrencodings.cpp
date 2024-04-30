@@ -14,18 +14,9 @@
 #include <limits>
 #include <sstream>
 
-#ifdef __clang__
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wsign-conversion"
-#pragma clang diagnostic ignored "-Wold-style-cast"
-#pragma clang diagnostic ignored "-Wconversion"
-#pragma clang diagnostic ignored "-Wtautological-type-limit-compare"
-#endif
-
 namespace bitcoin {
 
-static const std::string CHARS_ALPHA_NUM =
-    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+static const std::string CHARS_ALPHA_NUM = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 
 static const std::string SAFE_CHARS[] = {
     // SAFE_CHARS_DEFAULT
@@ -804,7 +795,3 @@ std::string ToUpper(const std::string_view str) {
 }
 
 } // end namespace bitcoin
-
-#ifdef __clang__
-#pragma clang diagnostic pop
-#endif

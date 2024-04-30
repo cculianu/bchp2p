@@ -11,13 +11,6 @@
 
 #include <type_traits>
 
-#ifdef __clang__
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wunused-parameter"
-#pragma clang diagnostic ignored "-Wold-style-cast"
-#pragma clang diagnostic ignored "-Wshorten-64-to-32"
-#pragma clang diagnostic ignored "-Wundefined-func-template"
-#endif
 namespace bitcoin {
 
 std::string COutPoint::ToString(bool fVerbose) const {
@@ -140,6 +133,3 @@ CTransaction::CTransaction(CMutableTransaction &&tx)
       mw_blob(std::move(tx.mw_blob)), hash(ComputeHash(false)) {}
 
 } // end namespace bitcoin
-#ifdef __clang__
-#pragma clang diagnostic pop
-#endif

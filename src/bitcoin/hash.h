@@ -16,12 +16,6 @@
 #include <type_traits>
 #include <vector>
 
-#ifdef __clang__
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wold-style-cast"
-#pragma clang diagnostic ignored "-Wsign-conversion"
-#endif
-
 namespace bitcoin {
 
 using ChainCode = uint256;
@@ -286,7 +280,3 @@ uint64_t SerializeSipHash(const T &obj, uint64_t k0, uint64_t k1,
 }
 
 } // namespace bitcoin
-
-#ifdef __clang__
-#pragma clang diagnostic pop
-#endif

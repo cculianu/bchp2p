@@ -8,14 +8,6 @@
 #include "crypto/hmac_sha512.h"
 #include "pubkey.h"
 
-#ifdef __clang__
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wold-style-cast"
-#pragma clang diagnostic ignored "-Wsign-conversion"
-#pragma clang diagnostic ignored "-Wshorten-64-to-32"
-#pragma clang diagnostic ignored "-Wunused-parameter"
-#endif
-
 namespace bitcoin {
 
 inline uint32_t ROTL32(uint32_t x, int8_t r) {
@@ -101,7 +93,3 @@ void BIP32Hash(const ChainCode &chainCode, uint32_t nChild, uint8_t header,
 
 
 } // end namespace bitcoin
-
-#ifdef __clang__
-#pragma clang diagnostic pop
-#endif

@@ -9,11 +9,6 @@
 #include <cstdint>
 #include <stdexcept>
 
-#ifdef __clang__
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wsign-conversion"
-#endif
-
 namespace bitcoin {
 
 /** Signature hash types/flags */
@@ -120,7 +115,3 @@ public:
 };
 
 } // end namespace bitcoin
-
-#ifdef __clang__
-#pragma clang diagnostic pop
-#endif

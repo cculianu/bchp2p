@@ -12,19 +12,6 @@
 #include <cstdint>
 #include <variant> // C++17, added by Calin as boost::variant work-alike
 
-#ifdef __clang__
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wold-style-cast"
-#pragma clang diagnostic ignored "-Wsign-conversion"
-#pragma clang diagnostic ignored "-Wshorten-64-to-32"
-#pragma clang diagnostic ignored "-Wunused-parameter"
-#pragma clang diagnostic ignored "-Wunused-template"
-#pragma clang diagnostic ignored "-Wtautological-unsigned-enum-zero-compare"
-#pragma clang diagnostic ignored "-Wstring-conversion"
-#pragma clang diagnostic ignored "-Wunreachable-code-break"
-#pragma clang diagnostic ignored "-Wcast-qual"
-#endif
-
 namespace bitcoin {
 
 inline constexpr bool DEFAULT_ACCEPT_DATACARRIER = true;
@@ -93,10 +80,10 @@ enum txnouttype {
 
 class CNoDestination {
 public:
-    friend bool operator==(const CNoDestination &a, const CNoDestination &b) {
+    friend bool operator==(const CNoDestination &, const CNoDestination &) {
         return true;
     }
-    friend bool operator<(const CNoDestination &a, const CNoDestination &b) {
+    friend bool operator<(const CNoDestination &, const CNoDestination &) {
         return true;
     }
 };
@@ -126,7 +113,3 @@ CScript GetScriptForRawPubKey(const CPubKey &pubkey);
 CScript GetScriptForMultisig(int nRequired, const std::vector<CPubKey> &keys);
 
 } // end namespace bitcoin
-
-#ifdef __clang__
-#pragma clang diagnostic pop
-#endif

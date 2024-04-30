@@ -18,19 +18,6 @@
 
 #include <cassert>
 
-#ifdef __clang__
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wold-style-cast"
-#pragma clang diagnostic ignored "-Wsign-conversion"
-#pragma clang diagnostic ignored "-Wshorten-64-to-32"
-#pragma clang diagnostic ignored "-Wunused-parameter"
-#pragma clang diagnostic ignored "-Wunused-template"
-#pragma clang diagnostic ignored "-Wtautological-unsigned-enum-zero-compare"
-#pragma clang diagnostic ignored "-Wstring-conversion"
-#pragma clang diagnostic ignored "-Wunreachable-code-break"
-#pragma clang diagnostic ignored "-Wcast-qual"
-#endif
-
 namespace bitcoin {
 
 bool CastToBool(const valtype &vch) {
@@ -1800,7 +1787,3 @@ bool VerifyScript(const CScript &scriptSig, const CScript &scriptPubKey,
 }
 
 } // end namespace bitcoin
-
-#ifdef __clang__
-#pragma clang diagnostic pop
-#endif

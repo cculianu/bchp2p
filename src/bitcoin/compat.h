@@ -11,11 +11,6 @@
 
 #include <type_traits>
 
-#ifdef __clang__
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wunused-parameter"
-#endif
-
 #ifdef WIN32
 #ifdef _WIN32_WINNT
 #undef _WIN32_WINNT
@@ -54,7 +49,7 @@
 #endif
 
 #ifndef WIN32
-typedef unsigned int SOCKET;
+using SOCKET = unsigned int;
 #include <errno.h>
 #define WSAGetLastError() errno
 #define WSAEINVAL EINVAL
@@ -79,20 +74,15 @@ typedef unsigned int SOCKET;
 #endif
 
 #ifndef WIN32
-typedef void *sockopt_arg_type;
+using sockopt_arg_type = void *;
 #else
-typedef char *sockopt_arg_type;
+using sockopt_arg_type = char *;
 #endif
 
-inline bool IsSelectableSocket(const SOCKET &s) {
-    (void)s;
+inline bool IsSelectableSocket(const SOCKET &s [[maybe_unused]]) {
 #ifdef WIN32
     return true;
 #else
-    return (s < FD_SETSIZE);
+    return s < FD_SETSIZE;
 #endif
 }
-
-#ifdef __clang__
-#pragma clang diagnostic pop
-#endif

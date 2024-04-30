@@ -23,14 +23,6 @@
 #include <utility>
 #include <vector>
 
-#ifdef __clang__
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wold-style-cast"
-#pragma clang diagnostic ignored "-Wsign-conversion"
-#pragma clang diagnostic ignored "-Wshorten-64-to-32"
-#pragma clang diagnostic ignored "-Wunused-parameter"
-#endif
-
 namespace bitcoin {
 /**
  * The maximum size of a serialized object in bytes or number of elements
@@ -1156,7 +1148,3 @@ size_t GetSerializeSizeMany(int nVersion, const T &... t) {
 }
 
 } // end namespace bitcoin
-
-#ifdef __clang__
-#pragma clang diagnostic pop
-#endif

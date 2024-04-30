@@ -13,15 +13,6 @@
 #include <stdexcept>
 #include <vector>
 
-#ifdef __clang__
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wold-style-cast"
-#pragma clang diagnostic ignored "-Wsign-conversion"
-#pragma clang diagnostic ignored "-Wshorten-64-to-32"
-#pragma clang diagnostic ignored "-Wunused-parameter"
-#pragma clang diagnostic ignored "-Wcast-qual"
-#endif
-
 namespace bitcoin {
 inline constexpr unsigned int BIP32_EXTKEY_SIZE = 74;
 
@@ -247,7 +238,3 @@ public:
 
 } // end namespace bitcoin
 
-
-#ifdef __clang__
-#pragma clang diagnostic pop
-#endif

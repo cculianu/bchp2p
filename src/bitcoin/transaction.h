@@ -17,14 +17,6 @@
 #include <optional>
 #include <utility>
 
-#ifdef __clang__
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wunused-function"
-#pragma clang diagnostic ignored "-Wunused-template"
-#pragma clang diagnostic ignored "-Wsign-conversion"
-#pragma clang diagnostic ignored "-Wshift-sign-overflow"
-#endif
-
 namespace bitcoin {
 /**
  * Flags that is ORed into the protocol version to designate that a transaction
@@ -495,7 +487,3 @@ struct PrecomputedTransactionData {
 };
 
 } // end namespace bitcoin
-
-#ifdef __clang__
-#pragma clang diagnostic pop
-#endif

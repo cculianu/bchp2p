@@ -19,16 +19,6 @@
 #include <string>
 #include <vector>
 
-#ifdef __clang__
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wunused-parameter"
-#pragma clang diagnostic ignored "-Wweak-vtables"
-#pragma clang diagnostic ignored "-Wsign-conversion"
-#pragma clang diagnostic ignored "-Wconversion"
-#pragma clang diagnostic ignored "-Wtautological-unsigned-enum-zero-compare"
-#pragma clang diagnostic ignored "-Wtautological-type-limit-compare"
-#pragma clang diagnostic ignored "-Wold-style-cast"
-#endif
 namespace bitcoin {
 
 // Maximum number of bytes pushable to the stack
@@ -933,7 +923,3 @@ struct CScriptWitness
 };
 
 } // end namespace bitcoin
-
-#ifdef __clang__
-#pragma clang diagnostic pop
-#endif

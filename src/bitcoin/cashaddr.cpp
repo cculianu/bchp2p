@@ -6,11 +6,6 @@
 #include "cashaddr.h"
 #include "utilvector.h"
 
-#ifdef __clang__
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wconversion"
-#endif
-
 namespace bitcoin {
 
 namespace {
@@ -303,8 +298,3 @@ std::pair<std::string, data> Decode(const std::string &str,
 } // namespace cashaddr
 
 } // namespace bitcoin
-
-#ifdef __clang__
-#pragma clang diagnostic pop
-#endif
-

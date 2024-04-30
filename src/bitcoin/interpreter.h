@@ -15,21 +15,6 @@
 #include <string>
 #include <vector>
 
-#ifdef __clang__
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wold-style-cast"
-#pragma clang diagnostic ignored "-Wsign-conversion"
-#pragma clang diagnostic ignored "-Wshorten-64-to-32"
-#pragma clang diagnostic ignored "-Wunused-parameter"
-#pragma clang diagnostic ignored "-Wunused-template"
-#pragma clang diagnostic ignored "-Wtautological-unsigned-enum-zero-compare"
-#pragma clang diagnostic ignored "-Wstring-conversion"
-#pragma clang diagnostic ignored "-Wunreachable-code-break"
-#pragma clang diagnostic ignored "-Wcast-qual"
-#pragma clang diagnostic ignored "-Wpadded"
-#pragma clang diagnostic ignored "-Wweak-vtables"
-#endif
-
 namespace bitcoin {
 
 class CPubKey;
@@ -110,7 +95,3 @@ bool VerifyScript(const CScript &scriptSig, const CScript &scriptPubKey,
                   ScriptError *serror = nullptr);
 
 } // end namespace bitcoin
-
-#ifdef __clang__
-#pragma clang diagnostic pop
-#endif

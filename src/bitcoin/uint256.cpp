@@ -12,12 +12,6 @@
 #include <cstring>
 #include <type_traits>
 
-#ifdef __clang__
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wold-style-cast"
-#pragma clang diagnostic ignored "-Wsign-conversion"
-#endif
-
 namespace bitcoin {
 
 // Some basic compile-time checks
@@ -86,8 +80,3 @@ template void base_blob<256>::SetHex(const char *) noexcept;
 template void base_blob<256>::SetHex(const std::string &) noexcept;
 
 } // end namespace bitcoin
-
-#ifdef __clang__
-#pragma clang diagnostic pop
-#endif
-
