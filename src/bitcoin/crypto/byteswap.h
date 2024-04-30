@@ -5,7 +5,7 @@
 #pragma once
 
 #if defined(HAVE_BITCOIN_CONFIG_H)
-#include <config/bitcoin-config.h>
+#include <bitcoin-config.h>
 #endif
 
 #include <cstdint>

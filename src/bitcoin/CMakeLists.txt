@@ -220,8 +220,8 @@ find_package(fmt REQUIRED)
 
 target_compile_definitions(bitcoin PUBLIC HAVE_BITCOIN_CONFIG_H)
 
-# Ensure #include <config/bitcoin-config.h> works
-target_include_directories(bitcoin PUBLIC ${CMAKE_CURRENT_BINARY_DIR})
+# Ensure #include <bitcoin-config.h> works
+target_include_directories(bitcoin PUBLIC ${CMAKE_CURRENT_BINARY_DIR}/config)
 
 target_compile_definitions(bitcoin PRIVATE USE_ASM)
 target_compile_options(bitcoin PRIVATE -Wall -Wno-unused-parameter)
