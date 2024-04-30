@@ -1080,7 +1080,7 @@ private:
 uint16_t ParsedArgs::ParsePort(std::string_view s, std::optional<std::string_view> orig_arg)
 {
     uint16_t port;
-    std::from_chars_result res;
+    std::from_chars_result res{};
     constexpr const auto ok = std::errc{};
     if (auto *beg = &*s.begin(), *end = &*s.end();
         beg == end || (res = std::from_chars(beg, end, port)).ptr != end || res.ec != ok) {

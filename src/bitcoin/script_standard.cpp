@@ -12,25 +12,17 @@
 #include <QtCore>
 #endif
 
-#ifdef __clang__
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wold-style-cast"
-#pragma clang diagnostic ignored "-Wsign-conversion"
-#pragma clang diagnostic ignored "-Wshorten-64-to-32"
-#pragma clang diagnostic ignored "-Wunused-parameter"
-#pragma clang diagnostic ignored "-Wunused-template"
-#pragma clang diagnostic ignored "-Wtautological-unsigned-enum-zero-compare"
-#pragma clang diagnostic ignored "-Wstring-conversion"
-#pragma clang diagnostic ignored "-Wunreachable-code-break"
-#pragma clang diagnostic ignored "-Wcast-qual"
-#endif
-
 namespace bitcoin {
 
 using valtype = std::vector<uint8_t>;
 
 bool fAcceptDatacarrier = DEFAULT_ACCEPT_DATACARRIER;
 
+#ifdef __GNUG__
+// work-around for buggy gcc warning incorrectly below
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wuninitialized"
+#endif
 ScriptID::ScriptID(const CScript &in, bool is32) : var{uint160{uint160::Uninitialized}} {
     if (is32) {
         var = Hash(in);
@@ -38,6 +30,9 @@ ScriptID::ScriptID(const CScript &in, bool is32) : var{uint160{uint160::Uninitia
         var = Hash160(in);
     }
 }
+#ifdef __GNUG__
+#pragma GCC diagnostic pop
+#endif
 
 const char *GetTxnOutputType(txnouttype t) {
     switch (t) {
@@ -332,7 +327,3 @@ bool IsValidDestination(const CTxDestination &dest) {
 }
 
 } // end namespace bitcoin
-
-#ifdef __clang__
-#pragma clang diagnostic pop
-#endif
