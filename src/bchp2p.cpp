@@ -1170,7 +1170,7 @@ ParsedArgs parseArgs(int argc, const char **argv)
             }
         }
     } catch (const std::exception &e) {
-        std::cout << e.what() << "\n";
+        std::cerr << e.what() << "\n";
         std::exit(EXIT_FAILURE);
     }
 
@@ -1189,7 +1189,7 @@ int main(int argc, const char *argv[]) {
     bitcoin::LogInstance().m_log_threadnames = true;
     std::signal(SIGPIPE, SIG_IGN); // required to avoid SIGPIPE when write()/read()
 
-    auto const & [connectToHosts, serverBinds] = parseArgs(argc, argv);
+    auto const & [connectToHosts, serverBinds] = parseArgs(argc, argv); // may exit prematurely if --help, --version, or bad args
 
     bitcoin::RandomInit();
     if (!bitcoin::Random_SanityCheck()) fmt::print(stderr, "{}", styled("WARNING: Random_SanityCheck failed!", fg(fmt::terminal_color::bright_yellow) | fmt::emphasis::bold));
