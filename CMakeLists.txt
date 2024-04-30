@@ -27,7 +27,7 @@ find_package(Boost 1.71.0 REQUIRED)
 # UniValue
 set(BUILD_BENCH OFF CACHE INTERNAL "Used by UniValue, disabled" FORCE)
 set(BUILD_TESTS OFF CACHE INTERNAL "Used by UniValue, disabled" FORCE)
-add_subdirectory(src/univalue)
+add_subdirectory(univalue)
 target_compile_options(univalue PRIVATE -Wall -Wno-unused-parameter)
 
 # BCHN modified sources, as a lib

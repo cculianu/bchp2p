@@ -12,13 +12,13 @@
 #include "bitcoin/utiltime.h"
 
 #include "argparse.hpp"
-#include "univalue.h"
 #include "util.h"
 
 #include <asio.hpp>
 #include <boost/algorithm/string.hpp>
 #include <boost/range/adaptors.hpp>
 #include <fmt/format.h>
+#include <univalue.h>
 
 #include <atomic>
 #include <bit>
