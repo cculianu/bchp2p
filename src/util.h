@@ -43,6 +43,9 @@ public:
     template <typename ...Args>
     Log(fmt::text_style ts, fmt::format_string<Args...> format, Args && ...args) : Log(true, format.get(), fmt::make_format_args(args...), ts) {}
 
+    template <typename ...Args>
+    Log(Color c, fmt::format_string<Args...> format, Args && ...args) : Log(true, format.get(), fmt::make_format_args(args...), fg(c)) {}
+
     ~Log();
 
     Log(Log &&o) noexcept : os{std::move(o.os)}, en{o.en}, ots{o.ots} { o.en = false; }
@@ -67,6 +70,10 @@ struct Debug : Log {
     Debug(fmt::text_style ts, fmt::format_string<Args...> format, Args && ...args)
         : Log(enabled.load(std::memory_order_relaxed), format, fmt::make_format_args(args...), ts) {}
 
+    template <typename ...Args>
+    Debug(Color c, fmt::format_string<Args...> format, Args && ...args)
+        : Debug(fg(c), format, std::forward<Args>(args)...) {}
+
     static std::atomic_bool enabled;
 };
 
@@ -80,6 +87,10 @@ struct Error : Log {
     template <typename ...Args>
     Error(fmt::text_style ts, fmt::format_string<Args...> format, Args && ...args)
         : Log(true, format, fmt::make_format_args(args...), ts) {}
+
+    template <typename ...Args>
+    Error(Color c, fmt::format_string<Args...> format, Args && ...args)
+        : Error(fg(c), format, std::forward<Args>(args)...) {}
 };
 
 struct Warning : Log {
@@ -92,4 +103,8 @@ struct Warning : Log {
     template <typename ...Args>
     Warning(fmt::text_style ts, fmt::format_string<Args...> format, Args && ...args)
         : Log(true, format, fmt::make_format_args(args...), ts) {}
+
+    template <typename ...Args>
+    Warning(Color c, fmt::format_string<Args...> format, Args && ...args)
+        : Warning(fg(c), format, std::forward<Args>(args)...) {}
 };

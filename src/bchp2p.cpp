@@ -341,7 +341,7 @@ public:
 
     Connection(Connection &&) = delete;
 
-    ~Connection() { Debug("{}: ~Connection", GetInfoStr()); }
+    ~Connection() { Debug(Color::bright_black, "{}: ~Connection", GetInfoStr()); }
 
     [[nodiscard]]
     async<> ProcessLoop();
@@ -443,10 +443,10 @@ async<> Connection::Send(bitcoin::CSerializedNetMsg msg)
 async<> Connection::ProcessLoop()
 {
     tstart = bitcoin::Tic();
-    Log("{}: Connection established\n", GetInfoStr());
+    Log(Color::bright_green, "{}: Connection established\n", GetInfoStr());
     Defer d([&] {
         scheduleDisconnect();
-        Log("{}: ProcessLoop ended, {} secs elapsed\n", GetInfoStr(), tstart.secsStr(3));
+        Log(Color::bright_green, "{}: ProcessLoop ended, {} secs elapsed\n", GetInfoStr(), tstart.secsStr(3));
     });
     if (!inbound) {
         // first thing we must do is send the version
