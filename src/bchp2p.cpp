@@ -1231,15 +1231,18 @@ std::unique_ptr<HttpServer> StartHttpServer(ConnMgr &mgr, const std::string_view
                 Debug(Color::bright_black, "{}: {}", key, value);
             }
         }
-        if (request->path.ends_with("favicon.ico")) {
-            // reject browser favicon.ico.. grr
+        // /, /stats
+        if (request->path == "/stats") {
+            const auto html = html_bits::MakePrettyHtmlForJson("BCH P2P Program Stats", mgr.GetStats());
+            response->write(html, {{"Content-type", "text/html"}});
+        } else if (request->path == "/") {
+            // redirect "/" to "/stats"
+            response->write(SimpleWeb::StatusCode::redirection_moved_permanently, {{"Location", "/stats"}});
+        } else {
+            // everything else is not found
             response->write(SimpleWeb::StatusCode::client_error_not_found);
             Debug(Color::bright_black, "HTTP: not found for \"{}\"", request->path);
-            return;
         }
-        // else.. every other /path
-        const auto html = html_bits::MakePrettyHtmlForJson("BCH P2P Program Stats", mgr.GetStats());
-        response->write(html, {{"Content-type", "text/html"}});
     };
     httpSrv->on_error = [](auto req, auto err) {
         auto const ep = req->remote_endpoint();
