@@ -1,5 +1,6 @@
 #include "bitcoin/block.h"
 #include "bitcoin/bloom.h"
+#include "bitcoin/crypto/sha256.h"
 #include "bitcoin/feerate.h"
 #include "bitcoin/hash.h"
 #include "bitcoin/logging.h"
@@ -1276,6 +1277,7 @@ int main(int argc, const char *argv[]) {
 
     bitcoin::RandomInit();
     if (!bitcoin::Random_SanityCheck()) fmt::print(stderr, "{}", styled("WARNING: Random_SanityCheck failed!", fg(fmt::terminal_color::bright_yellow) | fmt::emphasis::bold));
+    bitcoin::LogPrintf("Using SHA256: %s\n", bitcoin::SHA256AutoDetect());
 
     try {
         ConnMgr mgr;
