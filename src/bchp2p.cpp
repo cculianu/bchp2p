@@ -90,14 +90,15 @@ struct ChainParams
 enum Net : uint8_t { Main = 0, Chip, Test3, Test4, Scale, Reg, NumNets };
 
 const std::array<ChainParams, NumNets> netChainParams = {
+    // NB: these should be in the same order as the `Net` enum above
     ChainParams{ .name = "Main", .netMagic = {0xe3, 0xe1, 0xf3, 0xe8},
-                 .mostRecentCheckpoint = {823112,  uint256S("0000000000000000014e75464739e2b6f12a756f0d749cc15c243adb73ffbd5b")}},
+                 .mostRecentCheckpoint = {847762,  uint256S("0000000000000000010d0029ada78decbe529c1376ffc43466a28f5e585753ce")}},
     ChainParams{ .name = "Chip", .netMagic = {0xe2, 0xb7, 0xda, 0xaf},
-                 .mostRecentCheckpoint = {178140,  uint256S("000000003c37cc0372a5b9ccacca921786bbfc699722fc41e9fdbb1de4146ef1")}},
+                 .mostRecentCheckpoint = {200607,  uint256S("000000005b2192ec61f1089479ab90993896e31642ba24ae6948f913084c5ea5")}},
     ChainParams{ .name = "Test3", .netMagic = {0xf4, 0xe5, 0xf3, 0xf4},
-                 .mostRecentCheckpoint = {1582896, uint256S("000000000000088ef4d908ed35dc511b97fe4df78d5e37ab1e1aea4084d19506")}},
+                 .mostRecentCheckpoint = {1605521, uint256S("000000000000007d4c561056e9bcb3ab7591d024b18fff4bc27cca4d51d4780e")}},
     ChainParams{ .name = "Test4", .netMagic = {0xe2, 0xb7, 0xda, 0xaf},
-                 .mostRecentCheckpoint = {178150,  uint256S("00000000bd585ef9f37712bca4539acd8ec7c3b02620186dda1ee880bc07ba71")}},
+                 .mostRecentCheckpoint = {200741,  uint256S("0000000007d8ccbb767c269551dd81c520463066bec8654a18f4106aa53dc816")}},
     ChainParams{ .name = "Scale", .netMagic = {0xc3, 0xaf, 0xe1, 0xa2},
                  .mostRecentCheckpoint = {10000,   uint256S("00000000b711dc753130e5083888d106f99b920b1b8a492eb5ac41d40e482905")}},
     ChainParams{ .name = "Reg",   .netMagic = {0xda, 0xb5, 0xbf, 0xfa},
@@ -354,6 +355,8 @@ public:
     Id GetId() const { return id; }
 
     bool IsInbound() const { return inbound; }
+
+    Net GetNet() const { return net; }
 };
 
 std::shared_ptr<Connection> ConnMgr::CreateConnection(tcp::socket &&sock, bool inbound, Net net, std::string_view infoName = {})
