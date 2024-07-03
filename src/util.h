@@ -62,9 +62,11 @@ protected:
 struct Debug : Log {
     Debug() : Debug("") {}
 
+    static constexpr auto defaultColor = Color::cyan;
+
     template <typename ...Args>
     Debug(fmt::format_string<Args...> format, Args && ...args)
-        : Log(enabled.load(std::memory_order_relaxed), format, fmt::make_format_args(args...), fg(Color::cyan)) {}
+        : Log(enabled.load(std::memory_order_relaxed), format, fmt::make_format_args(args...), fg(defaultColor)) {}
 
     template <typename ...Args>
     Debug(fmt::text_style ts, fmt::format_string<Args...> format, Args && ...args)
@@ -80,9 +82,11 @@ struct Debug : Log {
 struct Error : Log {
     Error() : Error("") {}
 
+    static constexpr auto defaultColor = Color::bright_magenta;
+
     template <typename ...Args>
     Error(fmt::format_string<Args...> format, Args && ...args)
-        : Log(true, format, fmt::make_format_args(args...), fg(Color::bright_magenta)) {}
+        : Log(true, format, fmt::make_format_args(args...), fg(defaultColor)) {}
 
     template <typename ...Args>
     Error(fmt::text_style ts, fmt::format_string<Args...> format, Args && ...args)
@@ -96,9 +100,11 @@ struct Error : Log {
 struct Warning : Log {
     Warning() : Warning("") {}
 
+    static constexpr auto defaultColor = Color::bright_yellow;
+
     template <typename ...Args>
     Warning(fmt::format_string<Args...> format, Args && ...args)
-        : Log(true, format, fmt::make_format_args(args...), fg(Color::bright_yellow)) {}
+        : Log(true, format, fmt::make_format_args(args...), fg(defaultColor)) {}
 
     template <typename ...Args>
     Warning(fmt::text_style ts, fmt::format_string<Args...> format, Args && ...args)

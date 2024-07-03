@@ -19,18 +19,22 @@
 #include <asio.hpp>
 #include <boost/algorithm/string.hpp>
 #include <boost/range/adaptors.hpp>
+#include <fmt/chrono.h>
 #include <fmt/format.h>
 #include <server_http.hpp>
 #include <univalue.h>
 
+#include <algorithm>
 #include <atomic>
 #include <bit>
 #include <charconv>
+#include <chrono>
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <deque>
+#include <functional>
 #include <iostream>
 #include <map>
 #include <memory>
@@ -40,6 +44,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -65,10 +70,13 @@ void co_spawn_shared(const std::enable_shared_from_this<Ctx> &context, const asi
 
 using namespace std::string_view_literals;
 
-using bitcoin::Mutex;
-using bitcoin::SharedMutex;
+using bitcoin::CBlock;
+using bitcoin::CTransactionRef;
 using bitcoin::DebugLock;
 using bitcoin::DebugSharedLock;
+using bitcoin::Mutex;
+using bitcoin::SharedMutex;
+using bitcoin::Tic;
 using bitcoin::uint256;
 using bitcoin::uint256S;
 
@@ -88,7 +96,7 @@ struct ChainParams
     std::pair<uint32_t, uint256> mostRecentCheckpoint;
 };
 
-enum Net : uint8_t { Main = 0, Chip, Test3, Test4, Scale, Reg, NumNets };
+enum Net : uint8_t { Main = 0, Chip, Test3, Test4, Scale, Reg, NumNets, AnyNet = 0xffu /* special value! */ };
 
 const std::array<ChainParams, NumNets> netChainParams = {
     // NB: these should be in the same order as the `Net` enum above
@@ -108,6 +116,7 @@ const std::array<ChainParams, NumNets> netChainParams = {
 
 std::string_view Net2Name(Net net) {
     if (size_t(net) < netChainParams.size()) return netChainParams[size_t(net)].name;
+    else if (net == Net::AnyNet) return "*Any*"sv;
     return ""sv;
 }
 
@@ -115,6 +124,7 @@ std::optional<Net> Name2Net(std::string_view name, bool caseSensitive = false) {
     if (caseSensitive) {
         for (size_t i = 0; i < netChainParams.size(); ++i)
             if (name == netChainParams[i].name) return Net(i);
+        if (name == "*Any*"sv) return Net::AnyNet;
     } else {
         for (size_t i = 0; i < netChainParams.size(); ++i) {
             std::string lhs{name}, rhs{netChainParams[i].name};
@@ -122,6 +132,7 @@ std::optional<Net> Name2Net(std::string_view name, bool caseSensitive = false) {
             boost::algorithm::to_lower(rhs);
             if (lhs == rhs) return Net(i);
         }
+        if (std::string lhs{name}; boost::algorithm::to_lower(lhs), lhs == "*any*"sv) return Net::AnyNet;
     }
     return std::nullopt;
 }
@@ -146,7 +157,26 @@ private:
     void add(std::weak_ptr<Connection>);
     void rm(Id connId);
 
+    template <typename T>
+    using Ref = std::reference_wrapper<T>;
+
+    std::deque<bitcoin::CInv> invs2Spam GUARDED_BY(mut);
+
+    std::map<Ref<const uint256>, std::tuple<Tic, Net, CTransactionRef>> fakeMempool GUARDED_BY(mut);
+
+    CTransactionRef GetTxn_nolock(const Net net, const uint256 &txid) const SHARED_LOCKS_REQUIRED(mut) {
+        if (auto it = fakeMempool.find(txid); it != fakeMempool.end())
+            if (const auto txNet = std::get<1>(it->second); net == Net::AnyNet || txNet == Net::AnyNet || txNet == net)
+                return std::get<2>(it->second);
+        return {};
+    }
+
+    bool AddTxnToFakeMempool_nolock(Net net, const CTransactionRef &tx, bool pushInvs) EXCLUSIVE_LOCKS_REQUIRED(mut);
+
 public:
+    ConnMgr(std::vector<CTransactionRef> txns2Spam = {});
+    ~ConnMgr();
+
     /// Creates a new Connection object. `sock` should be an newly connected socket.
     std::shared_ptr<Connection> CreateConnection(tcp::socket &&sock, bool inbound, Net net, std::string_view infoName);
 
@@ -183,7 +213,121 @@ public:
     }
 
     UniValue::Object GetStats() const;
+
+    CTransactionRef GetTxn(Net net, const uint256 &txid) const {
+        LOCK_SHARED(mut);
+        return GetTxn_nolock(net, txid);
+    }
+
+    std::vector<bitcoin::CInv> GetInvsToSpam(); /* intentionally non-const since it may clear/delete/maintain invs2Spam */
+
+    bool AddTxnToFakeMempool(Net net, const CTransactionRef &tx, bool pushInvs = true) {
+        LOCK(mut);
+        return AddTxnToFakeMempool_nolock(net, tx, pushInvs);
+    }
+
+    bool ProcessBlock(Net net, const uint256 &hash, const CBlock &blk) {
+        LOCK(mut);
+        if (haveInv_nolock(hash)) return false;
+        haveInvs.insert(hash);
+        size_t nRemoved{};
+        for (const auto &tx : blk.vtx) {
+            if (auto it = fakeMempool.find(tx->GetHashRef());
+                    it != fakeMempool.end() && (get<1>(it->second) == net || get<1>(it->second) == Net::AnyNet)) {
+                fakeMempool.erase(it);
+                ++nRemoved;
+            }
+        }
+        if (nRemoved) Log("{}: Removed {} txns from fakeMempool that appear in block {}", __func__, nRemoved, hash.ToString());
+        return true;
+    }
+
+    void Cancel() {
+        if (!cancelled) {
+            Debug(Color::bright_black, "ConnMgr: Canceling processing ...");
+            cancelled = true;
+            cleaner.cancel();
+        }
+    }
+
+    void Start();
+
+private:
+    asio::steady_timer cleaner{*io_context};
+    bool cancelled = false, started = false;
+
+    async<> cleanFakeMempool();
 };
+
+ConnMgr::ConnMgr(std::vector<CTransactionRef> txns2Spam) {
+    Start();
+
+    LOCK(mut);
+    for (const auto &tx : txns2Spam)
+        if (AddTxnToFakeMempool_nolock(Net::AnyNet, tx, false))
+            invs2Spam.emplace_back(bitcoin::MSG_TX, tx->GetHashRef());
+}
+
+ConnMgr::~ConnMgr() {
+    Cancel();
+    Debug(Color::bright_black, "~ConnMgr");
+}
+
+void ConnMgr::Start() {
+    if (!started) {
+        started = true;
+        co_spawn(io_context->get_executor(), cleanFakeMempool(), detached);
+    }
+}
+
+async<> ConnMgr::cleanFakeMempool()
+{
+    Debug("{}: started", __func__);
+    Defer d([f=std::string_view{__func__}]{ Debug("{}: stopped", f); });
+    constexpr int cleanTime = 20 * 60; /* 20 mins */
+    while (!cancelled) {
+        cleaner.expires_from_now(std::chrono::seconds{cleanTime / 2});
+        co_await cleaner.async_wait(use_awaitable);
+        if (cancelled) co_return;
+        Debug("{}: wakeup", __func__);
+        size_t nDeleted = 0;
+        {
+            LOCK(mut);
+            for (auto it = fakeMempool.begin(); it != fakeMempool.end(); /**/) {
+                if (std::get<0>(it->second).secs<int64_t>() >= cleanTime) {
+                    it = fakeMempool.erase(it);
+                    ++nDeleted;
+                } else
+                    ++it;
+            }
+        }
+        if (nDeleted) {
+            const size_t oldSz = invs2Spam.size();
+            const size_t newSz = GetInvsToSpam().size(); // this implicitly "cleans" the invs2Spam deque
+            Log("{}: deleted {} txns{} from the fake mempool that are older than {} seconds", __func__, nDeleted,
+                newSz < oldSz ? fmt::format(" (including {} invs2Spam txs)", oldSz - newSz) : std::string{},
+                cleanTime);
+
+        }
+    }
+}
+
+std::vector<bitcoin::CInv> ConnMgr::GetInvsToSpam() {
+    std::vector<bitcoin::CInv> ret;
+    {
+        LOCK(mut);
+        ret.reserve(invs2Spam.size());
+        for (auto it = invs2Spam.begin(); it != invs2Spam.end(); /**/)
+            if (const auto &inv = *it; inv.IsTx() && fakeMempool.find(inv.hash) != fakeMempool.end())
+                // still exists, add
+                ret.push_back(inv), ++it;
+            else
+                // was cleaned.. delete
+                it = invs2Spam.erase(it);
+    }
+    return ret;
+}
+
 
 class Connection : public std::enable_shared_from_this<Connection>
 {
@@ -197,7 +341,8 @@ class Connection : public std::enable_shared_from_this<Connection>
     std::string infoName;
     const uint64_t nLocalNonce;
     bitcoin::Tic tstart;
-    bool disconnectRequested = false, pingerScheduled = false, cleanerScheduled = false;
+    bool disconnectRequested = false, pingerScheduled = false, cleanerScheduled = false, didScheduleInvSender = false;
+    bitcoin::CRollingBloomFilter peerHasInvs {750'000, 0.0001};
 
     std::map<std::string_view, size_t> msgByteCountsIn, msgByteCountsOut, msgCountsIn{}, msgCountsOut{};
     size_t bytesIn{}, bytesOut{}, msgsIn{}, msgsOut{};
@@ -212,6 +357,7 @@ class Connection : public std::enable_shared_from_this<Connection>
     bitcoin::Amount feeFilter;
 
     std::map<uint256, int64_t> requestedInvs;
+    std::deque<bitcoin::CInv> invQ;
 
     [[nodiscard]]
     async<> MsgHandler(bitcoin::CSerializedNetMsg && msg);
@@ -239,12 +385,15 @@ class Connection : public std::enable_shared_from_this<Connection>
     [[nodiscard]] async<> HandlePong(bitcoin::CSerializedNetMsg && msg);
     [[nodiscard]] async<> HandleInvs(bitcoin::CSerializedNetMsg && msg);
     [[nodiscard]] async<> HandleTx(bitcoin::CSerializedNetMsg && msg);
+    [[nodiscard]] async<> HandleBlock(bitcoin::CSerializedNetMsg && msg);
     [[nodiscard]] async<> HandleFeeFilter(bitcoin::CSerializedNetMsg && msg);
     [[nodiscard]] async<> HandleAddr(bitcoin::CSerializedNetMsg && msg);
     [[nodiscard]] async<> HandleHeaders(bitcoin::CSerializedNetMsg && msg);
     [[nodiscard]] async<> HandleReject(bitcoin::CSerializedNetMsg && msg);
+    [[nodiscard]] async<> HandleGetData(bitcoin::CSerializedNetMsg && msg);
 
     [[nodiscard]] async<> DoOnceIfAfterHandshake(); // does GETADDR, etc -- stuff we do immediately after a state change to "fully established"
+    [[nodiscard]] async<> InvSender();
 
     static constexpr int pingIntervalSecs = 30;
     uint64_t lastPingNonceSent = 0;
@@ -263,7 +412,7 @@ class Connection : public std::enable_shared_from_this<Connection>
 
     void Misbehaving(int score, std::string_view msg);
 
-    asio::steady_timer pinger, cleaner;
+    asio::steady_timer pinger, cleaner, spamInvs;
 
     [[nodiscard]]
     async<> CancelProcessing() {
@@ -272,6 +421,7 @@ class Connection : public std::enable_shared_from_this<Connection>
         asio::error_code ec;
         pinger.cancel(ec);
         cleaner.cancel(ec);
+        spamInvs.cancel(ec);
         Debug("{}: shutdown ...\n", GetInfoStr());
         sock.shutdown(sock.shutdown_both, ec);
         auto e = co_await this_coro::executor;
@@ -304,6 +454,13 @@ class Connection : public std::enable_shared_from_this<Connection>
         }
     }
 
+    void scheduleInvSender() {
+        if (!didScheduleInvSender) {
+            didScheduleInvSender = true;
+            co_spawn_shared(*this, sock.get_executor(), InvSender(), detached);
+        }
+    }
+
     unsigned GetCheckpointHeight() const {
         return !params.mostRecentCheckpoint.second.IsNull() ? params.mostRecentCheckpoint.first : 0;
     }
@@ -315,7 +472,7 @@ protected:
     Connection(ConnMgr *mgr, tcp::socket &&sock_, bool inbound_, Net net_, std::string_view infoName_)
         : mgr(mgr), sock(std::move(sock_)), inbound(inbound_), net(net_), params(netChainParams.at(net)),
           infoName(infoName_), nLocalNonce(bitcoin::GetRand64()), pinger(sock.get_executor()),
-          cleaner(sock.get_executor())
+          cleaner(sock.get_executor()), spamInvs(sock.get_executor())
     {
         bitcoin::CService srv;
         auto ep2srv = [](const tcp::endpoint &ep) {
@@ -390,6 +547,21 @@ void ConnMgr::rm(Id id) {
     }
 }
 
+bool ConnMgr::AddTxnToFakeMempool_nolock(Net net, const CTransactionRef &tx, bool pushInvs) {
+    const auto &txid = tx->GetHashRef();
+    const auto & [it, inserted] = fakeMempool.try_emplace(std::ref(txid), std::tuple(Tic{}, net, tx));
+    if (inserted)  {
+        haveInvs.insert(tx->GetHashRef());
+        if (pushInvs) {
+            for (const auto & [id, wptr] : conns) {
+                auto conn = wptr.lock();
+                if (!conn || (net != Net::AnyNet && conn->GetNet() != net) || conn->peerHasInvs.contains(tx->GetHashRef())) continue;
+                conn->invQ.emplace_back(bitcoin::MSG_TX, tx->GetHashRef());
+            }
+        }
+    }
+    return inserted;
+}
 
 async<> Connection::SendVersion()
 {
@@ -423,9 +595,10 @@ async<> Connection::Send(bitcoin::CSerializedNetMsg msg)
 {
     using namespace bitcoin;
     CMessageHeader hdr(params.netMagic, msg); // construct valid header with checksum
-    std::vector<uint8_t> hdrdata;
-    VectorWriter(SER_NETWORK, PROTOCOL_VERSION, hdrdata, 0) << hdr;
-    const size_t msgSize = hdrdata.size() + msg.data.size();
+    std::vector<uint8_t> outdata;
+    outdata.reserve(CMessageHeader::HEADER_SIZE + msg.data.size());
+    VectorWriter(SER_NETWORK, PROTOCOL_VERSION, outdata, 0) << hdr;
+    const size_t msgSize = outdata.size() + msg.data.size();
     const auto cmd = hdr.GetCommand();
     Log("{}: Sending msg {} {} bytes\n", GetInfoStr(), cmd, msgSize);
     const auto ncmd = NetMsgType::Normalize(cmd); // assumption: Normalize() returns a long-lived string_view!
@@ -434,8 +607,12 @@ async<> Connection::Send(bitcoin::CSerializedNetMsg msg)
     bytesOut += msgSize;
     ++msgsOut;
     Tic t0;
-    co_await asio::async_write(sock, asio::buffer(hdrdata), use_awaitable); // send header
-    co_await asio::async_write(sock, asio::buffer(msg.data), use_awaitable); // send payload
+    {
+        // NB: we must do it this way to ensure serialized access to the socket.. so we must write as 1 write not 2
+        outdata.insert(outdata.end(), msg.data.begin(), msg.data.end()); // concatenate header + payload
+        msg.data = std::vector<uint8_t>{}; // release memory
+        co_await asio::async_write(sock, asio::buffer(outdata), use_awaitable);
+    }
     Debug("{}: {} msec for '{}' xfer\n", GetInfoStr(), t0.msecStr(), ncmd);
 }
 
@@ -534,8 +711,16 @@ async<> Connection::MsgHandler(bitcoin::CSerializedNetMsg && msg)
             co_return co_await HandleInvs(std::move(msg));
         }
 
+        if (ncmd == NetMsgType::GETDATA) {
+            co_return co_await HandleGetData(std::move(msg));
+        }
+
         if (ncmd == NetMsgType::TX) {
             co_return co_await HandleTx(std::move(msg));
+        }
+
+        if (ncmd == NetMsgType::BLOCK) {
+            co_return co_await HandleBlock(std::move(msg));
         }
 
         if (ncmd == NetMsgType::FEEFILTER) {
@@ -647,7 +832,13 @@ async<> Connection::DoOnceIfAfterHandshake() {
             uint64_t const nCMPCTBLOCKVersion = 1;
             co_await Send(NetMsgType::SENDCMPCT, fAnnounceUsingCMPCTBLOCK, nCMPCTBLOCKVersion); // testing!
         }
-        co_await Send(NetMsgType::MEMPOOL); // testing!
+        if (const auto invs2Spam = mgr->GetInvsToSpam(); invs2Spam.empty())
+            co_await Send(NetMsgType::MEMPOOL); // testing!
+        else {
+            // spam txns mode, enqueue all the invs from ConnMgr
+            invQ.insert(invQ.end(), invs2Spam.begin(), invs2Spam.end());
+        }
+        scheduleInvSender();
         schedulePinger();
         scheduleCleaner();
     }
@@ -716,7 +907,7 @@ async<> Connection::HandleInvs(bitcoin::CSerializedNetMsg && msg)
 {
     using namespace bitcoin;
     bool const notfound = msg.m_type == NetMsgType::NOTFOUND;
-    std::vector<bitcoin::CInv> invs;
+    std::vector<CInv> invs;
     MakeReader(msg) >> invs;
     Debug("{}: Got {} inv(s){}", GetInfoStr(), invs.size(), notfound ? " NOTFOUND" : "");
     if (invs.size() > MAX_INV_SZ) {
@@ -738,32 +929,36 @@ async<> Connection::HandleInvs(bitcoin::CSerializedNetMsg && msg)
     }
 
     // handle normal INV
-    std::vector<bitcoin::CInv> dontHaveTxs;
-    dontHaveTxs.reserve(invs.size());
+    std::vector<CInv> wantInvs;
+    wantInvs.reserve(invs.size());
+
+    // first, register all invs seen as "peer has inv"
+    for (const auto & inv : invs)
+        peerHasInvs.insert(inv.hash);
+
     {
         LOCK_SHARED(mgr->mut);
         for (auto & inv : invs) {
-            if (inv.IsTx()) {
+            if (inv.IsTx() || inv.GetKind() == MSG_BLOCK) {
                 if (!mgr->haveInv_nolock(inv.hash) && !requestedInvs.contains(inv.hash)) {
-                    dontHaveTxs.push_back(std::move(inv));
-                    Debug("{}: Got new inv: {}", GetInfoStr(), dontHaveTxs.back().ToString());
+                    wantInvs.push_back(std::move(inv));
+                    Debug("{}: Got new inv: {}", GetInfoStr(), wantInvs.back().ToString());
                 } else {
                     Debug("{}: Ignoring inv: {}", GetInfoStr(), inv.ToString());
                 }
             } else {
-                Debug("{}: Ignoring non-tx inv: {}", GetInfoStr(), inv.ToString());
+                Debug("{}: Ignoring unknown inv: {}", GetInfoStr(), inv.ToString());
             }
         }
     }
     invs = decltype(invs){}; // clear `invs` memory
-    if ( ! dontHaveTxs.empty()) {
+    if ( ! wantInvs.empty()) {
         auto const now = GetTimeMicros();
-        for (const auto & inv : dontHaveTxs) {
+        for (const auto & inv : wantInvs) {
             requestedInvs[inv.hash] = now;
-            assert(inv.IsTx());
         }
-        Debug("{}: Requesting {} txns ...", GetInfoStr(), dontHaveTxs.size());
-        co_await Send(NetMsgType::GETDATA, std::move(dontHaveTxs));
+        Debug("{}: Requesting {} inv items ...", GetInfoStr(), wantInvs.size());
+        co_await Send(NetMsgType::GETDATA, std::move(wantInvs));
     }
 }
 
@@ -774,6 +969,7 @@ async<> Connection::HandleTx(bitcoin::CSerializedNetMsg && msg)
     MakeReader(msg) >> tx;
 
     double elapsedMSec;
+    peerHasInvs.insert(tx->GetHashRef());
     if (auto it = requestedInvs.find(tx->GetHashRef()); it == requestedInvs.end()) {
         Misbehaving(1, fmt::format("Unrequested tx {}", tx->GetHashRef().ToString()));
         co_return;
@@ -781,10 +977,46 @@ async<> Connection::HandleTx(bitcoin::CSerializedNetMsg && msg)
         elapsedMSec = (GetTimeMicros() - it->second) / 1e3;
         requestedInvs.erase(it);
     }
-    mgr->setHaveInv(tx->GetHashRef());
-    Debug("{}: Got tx GETDATA reply in {:1.3f} msec. Txid: {}, size: {}, version: {}, nins: {}, nouts: {}",
-          GetInfoStr(), elapsedMSec, tx->GetHashRef().ToString(), tx->GetTotalSize(), tx->nVersion,
-          tx->vin.size(), tx->vout.size());
+    if (mgr->AddTxnToFakeMempool(GetNet(), tx))
+        Debug("{}: Got TX reply in {:1.3f} msec. txid: {}, size: {}, version: {}, nins: {}, nouts: {}",
+              GetInfoStr(), elapsedMSec, tx->GetHashRef().ToString(), tx->GetTotalSize(), tx->nVersion,
+              tx->vin.size(), tx->vout.size());
+    else
+        Debug("{}: Got TX reply in {:1.3f} msec. txid: {}; already have tx",
+              GetInfoStr(), elapsedMSec, tx->GetHashRef().ToString());
+}
+
+async<> Connection::HandleBlock(bitcoin::CSerializedNetMsg && msg)
+{
+    using namespace bitcoin;
+    CBlock blk;
+    MakeReader(msg) >> blk;
+    const auto hash = blk.GetHash();
+
+    double elapsedMSec;
+    peerHasInvs.insert(hash);
+    if (auto it = requestedInvs.find(hash); it == requestedInvs.end()) {
+        Misbehaving(1, fmt::format("Unrequested block {}", hash.ToString()));
+        co_return;
+    } else {
+        elapsedMSec = (GetTimeMicros() - it->second) / 1e3;
+        requestedInvs.erase(it);
+    }
+    if (mgr->ProcessBlock(GetNet(), hash, blk)) {
+        auto ins_n_outs = std::pair<size_t, size_t>(0U, 0U);
+        ins_n_outs = std::accumulate(blk.vtx.begin(), blk.vtx.end(), ins_n_outs,
+                                     [](const auto &accum, const auto &tx){
+                                         return std::pair<size_t, size_t>(accum.first + tx->vin.size(),
+                                                                          accum.second + tx->vout.size());
+                                     });
+        const auto tp = std::chrono::system_clock::from_time_t(blk.GetBlockTime());
+        auto timeStr = fmt::format("{:%Y-%m-%d %H:%M:%S}", tp);
+        Debug("{}: Got BLOCK reply in {:1.3f} msec. hash: {}, size: {}, time: {} ({}), prevBlk: {}, nTx: {}, nIns: {}, nOuts: {}",
+              GetInfoStr(), elapsedMSec, hash.ToString(), bitcoin::GetSerializeSize(blk), blk.GetBlockTime(), timeStr,
+              blk.hashPrevBlock.ToString(), blk.vtx.size(), ins_n_outs.first, ins_n_outs.second);
+    } else
+        Debug("{}: Got BLOCK reply in {:1.3f} msec. hash: {}; already seen block",
+              GetInfoStr(), elapsedMSec, hash.ToString());
 }
 
 async<> Connection::HandleFeeFilter(bitcoin::CSerializedNetMsg && msg)
@@ -873,6 +1105,51 @@ async<> Connection::HandleReject(bitcoin::CSerializedNetMsg && msg)
     co_return;
 }
 
+async<> Connection::HandleGetData(bitcoin::CSerializedNetMsg && msg)
+{
+    using namespace bitcoin;
+    std::vector<CInv> invs, invsNotFound;
+    MakeReader(msg) >> invs;
+    if (invs.size() > MAX_INV_SZ) {
+        auto err = fmt::format("Too many invs ({})", invs.size());
+        Misbehaving(20, "too-many-inv");
+        co_return co_await Send(NetMsgType::REJECT, msg.m_type, REJECT_INVALID, err);
+    }
+
+    Debug("{}: Received getdata ({} invsz)", GetInfoStr(), invs.size());
+
+    if ( ! invs.empty()) {
+        Debug("{}: First inv is a getdata for: {}", GetInfoStr(), invs.front().ToString());
+    }
+
+    for (auto & inv : invs) {
+        const auto & hash = inv.hash;
+        bool found = false;
+        if (inv.IsTx()) {
+            if (auto tx = mgr->GetTxn(GetNet(), hash)) {
+                found = true;
+                if (Debug::enabled)
+                    Debug("{}: Sending tx {} ({} bytes) ...", GetInfoStr(),
+                          styled(tx->GetHashRef().ToString(), fg(Color::green)|fmt::emphasis::italic),
+                          styled(tx->GetTotalSize(), fg(Color::bright_yellow)|fmt::emphasis::bold));
+                co_await Send(NetMsgType::TX, *tx);
+                peerHasInvs.insert(tx->GetHashRef());
+            }
+        } else {
+            Debug("{}: Unsupported GETDATA for: {}", GetInfoStr(), inv.ToString());
+        }
+        if ( ! found)
+            invsNotFound.push_back(std::move(inv));
+    }
+
+    if ( ! invsNotFound.empty()) {
+        Debug("{}: Could not find {} invs\n", GetInfoStr(), styled(invsNotFound.size(), fg(Color::bright_black)|fmt::emphasis::italic));
+        co_await Send(NetMsgType::NOTFOUND, std::move(invsNotFound));
+    }
+
+    co_return;
+}
+
 async<> Connection::Pinger()
 {
     using namespace bitcoin;
@@ -919,6 +1196,41 @@ async<> Connection::Cleaner()
         cleaner.expires_from_now(std::chrono::seconds{isFullyConnected() ? cleanIntervalSecs : 5});
         co_await cleaner.async_wait(use_awaitable);
         Debug("{}: Cleaner wakeup ..", GetInfoStr());
+    }
+}
+
+async<> Connection::InvSender()
+{
+    using namespace bitcoin;
+    Debug("{}: InvSender started", GetInfoStr());
+    Defer d([&]{ Debug("{}: InvSender stopped", GetInfoStr()); });
+    auto Wait  = [&](unsigned msecs = 100) -> async<> {
+        spamInvs.expires_from_now(std::chrono::milliseconds{msecs});
+        co_await spamInvs.async_wait(use_awaitable);
+    };
+    while (!isFullyConnected()) {
+        co_await Wait();
+        if (disconnectRequested) co_return;
+    }
+
+    constexpr size_t maxInvSend = std::min<size_t>(MAX_INV_SZ, 100u /* default max orphans */);
+
+    std::vector<CInv> invs;
+
+    // Keep polling for new invs to send
+    while (isFullyConnected() && !disconnectRequested) {
+        if (!invQ.empty()) {
+            const auto endit = invQ.begin() + std::min(maxInvSend, invQ.size());
+            invs.insert(invs.end(), invQ.begin(), endit);
+            invQ.erase(invQ.begin(), endit);
+            const auto sent = invs.size();
+            Debug("{}: {} sending {} invs ...", GetInfoStr(), __func__, invs.size());
+            co_await Send(bitcoin::NetMsgType::INV, std::move(invs));
+            invs.clear();
+            co_await Wait(10 * sent);
+        } else {
+            co_await Wait(10u);
+        }
     }
 }
 
@@ -986,6 +1298,7 @@ UniValue::Object ConnMgr::GetStats() const
     UniValue::Object ret;
     ret.reserve(6);
     LOCK_SHARED(mut);
+    ret.emplace_back("fake_mempool_txns", fakeMempool.size());
     ret.emplace_back("num_conns", conns.size());
     ret.emplace_back("num_lost_conns", connsLost);
     ret.emplace_back("num_connected_inbound", nInbound.load());
@@ -1066,6 +1379,7 @@ struct ParsedArgs
     VecTup serverBinds;
     std::optional<std::string> httpServerInterface;
     std::optional<uint16_t> httpServerPort;
+    std::vector<CTransactionRef> txnsToSpam;
 
     static Tup ParseHostPortNet(std::string_view s) { return ParseHostPortNetCommon(s, true); }
     static auto ParseHostPort(std::string_view s) {
@@ -1133,7 +1447,7 @@ auto ParsedArgs::ParseHostPortNetCommon(std::string_view const orig_arg, bool co
     if (!parts.empty()) {
         // parse last net arg
         auto res = Name2Net(parts.front());
-        if (!res) throw std::runtime_error(fmt::format("Bad net for argument: {}", orig_arg));
+        if (!res || *res == Net::AnyNet) throw std::runtime_error(fmt::format("Bad net for argument: {}", orig_arg));
         net = *res;
         parts.pop_front();
     }
@@ -1175,6 +1489,10 @@ ParsedArgs parseArgs(int argc, const char **argv)
         .help("Start the info http server on this interface and port (0 to disable)").metavar("[INTERFACE:]PORT")
         .default_value("127.0.0.1:8080");
 
+    ap.add_argument("--spamtxs", "-S")
+        .help("Spam txs when connecting to peers from this JSON file (JSON content should be an array of hex encoded txns)").metavar("JSONFILE")
+        .nargs(1);
+
     using namespace boost;
     std::string const netlist = algorithm::join(
         netChainParams | adaptors::transformed([](const auto &cp) { return boost::algorithm::to_lower_copy(std::string{cp.name}); }),
@@ -1198,6 +1516,29 @@ ParsedArgs parseArgs(int argc, const char **argv)
         if (ap.is_used("listen")) {
             for (const auto &arg : ap.get<std::vector<std::string>>("listen")) {
                 ret.serverBinds.push_back(ParsedArgs::ParseHostPortNet(arg));
+            }
+        }
+        if (ap.is_used("spamtxs")) {
+            const auto &file = ap.get<>("spamtxs");
+            FILE *f = std::fopen(file.c_str(), "rt");
+            if (!f) throw std::runtime_error(fmt::format("Unable to open '{}': {}", file, std::strerror(errno)));
+            Defer d([&]{ if (f) std::fclose(f), f = nullptr; });
+            char buf[4096];
+            std::string json;
+            while (const size_t nread = std::fread(buf, 1, sizeof(buf), f)) {
+                json.append(buf, std::min(nread, sizeof(buf)));
+            }
+            UniValue uv;
+            std::string::size_type err{};
+            if ( ! uv.read(json, &err)) {
+                throw std::runtime_error(fmt::format("Failed to read json from '{}', error at position {}", file, err));
+            }
+            if (! uv.isArray()) throw std::runtime_error("Expected JSON top-level object to be an array");
+            for (const auto &item : uv.get_array()) {
+                const auto txbytes = bitcoin::ParseHex(item.get_str());
+                CTransactionRef & tx = ret.txnsToSpam.emplace_back();
+                bitcoin::VectorReader(bitcoin::SER_NETWORK, bitcoin::PROTOCOL_VERSION, txbytes, 0, tx);
+                if (!tx) throw std::runtime_error("Unexpected null ptr for unserialized tx! This shouldn't happen!");
             }
         }
 
@@ -1273,14 +1614,15 @@ int main(int argc, const char *argv[]) {
     bitcoin::LogInstance().m_log_threadnames = true;
     std::signal(SIGPIPE, SIG_IGN); // required to avoid SIGPIPE when write()/read()
 
-    auto const & [connectToHosts, serverBinds, httpInterface, httpPort] = parseArgs(argc, argv); // may exit prematurely if --help, --version, or bad args
+    ParsedArgs args = parseArgs(argc, argv); // may exit prematurely if --help, --version, or bad args;
+    auto & [connectToHosts, serverBinds, httpInterface, httpPort, txnsToSpam] = args;
 
     bitcoin::RandomInit();
     if (!bitcoin::Random_SanityCheck()) fmt::print(stderr, "{}", styled("WARNING: Random_SanityCheck failed!", fg(fmt::terminal_color::bright_yellow) | fmt::emphasis::bold));
-    bitcoin::LogPrintf("Using SHA256: %s\n", bitcoin::SHA256AutoDetect());
+    Log("Using SHA256: {}", styled(bitcoin::SHA256AutoDetect(), fg(fmt::terminal_color::white)|bg(fmt::terminal_color::blue)|fmt::emphasis::bold));
 
     try {
-        ConnMgr mgr;
+        ConnMgr mgr(std::move(txnsToSpam));
         asio::io_context & io_context = *mgr.io_context;
 
         asio::signal_set signals(io_context, SIGINT, SIGTERM, SIGUSR1);
