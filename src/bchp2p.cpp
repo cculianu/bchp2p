@@ -8,6 +8,7 @@
 #include "bitcoin/streams.h"
 #include "bitcoin/sync.h"
 #include "bitcoin/random.h"
+#include "bitcoin/utilsaltedhashers.h"
 #include "bitcoin/utilstrencodings.h"
 #include "bitcoin/utilthreadnames.h"
 #include "bitcoin/utiltime.h"
@@ -159,17 +160,27 @@ private:
     void add(std::weak_ptr<Connection>);
     void rm(Id connId);
 
+    std::deque<bitcoin::CInv> invs2Spam GUARDED_BY(mut);
+
+    struct FakeMempoolEntry {
+        Tic tic;
+        Net net;
+        CTransactionRef tx;
+
+        FakeMempoolEntry() = default;
+        FakeMempoolEntry(const Tic &t, const Net n, const CTransactionRef &tx_) : tic{t}, net{n}, tx{tx_} {}
+    };
+
     template <typename T>
     using Ref = std::reference_wrapper<T>;
 
-    std::deque<bitcoin::CInv> invs2Spam GUARDED_BY(mut);
-
-    std::map<Ref<const uint256>, std::tuple<Tic, Net, CTransactionRef>> fakeMempool GUARDED_BY(mut);
+    std::unordered_map<Ref<const uint256>, FakeMempoolEntry, bitcoin::SaltedUint256Hasher>
+        fakeMempool GUARDED_BY(mut);
 
     CTransactionRef GetTxn_nolock(const Net net, const uint256 &txid) const SHARED_LOCKS_REQUIRED(mut) {
         if (auto it = fakeMempool.find(txid); it != fakeMempool.end())
-            if (const auto txNet = std::get<1>(it->second); net == Net::AnyNet || txNet == Net::AnyNet || txNet == net)
-                return std::get<2>(it->second);
+            if (net == Net::AnyNet || it->second.net == Net::AnyNet || it->second.net == net)
+                return it->second.tx;
         return {};
     }
 
@@ -237,7 +248,7 @@ public:
         auto & blk = *pblk;
         for (const auto &tx : blk.vtx) {
             if (auto it = fakeMempool.find(tx->GetHashRef());
-                    it != fakeMempool.end() && (get<1>(it->second) == net || get<1>(it->second) == Net::AnyNet)) {
+                    it != fakeMempool.end() && (it->second.net == net || it->second.net == Net::AnyNet)) {
                 fakeMempool.erase(it);
                 ++nRemoved;
             }
@@ -298,7 +309,7 @@ async<> ConnMgr::cleanFakeMempool()
         {
             LOCK(mut);
             for (auto it = fakeMempool.begin(); it != fakeMempool.end(); /**/) {
-                if (std::get<0>(it->second).secs<int64_t>() >= cleanTime) {
+                if (it->second.tic.secs<int64_t>() >= cleanTime) {
                     it = fakeMempool.erase(it);
                     ++nDeleted;
                 } else
@@ -361,7 +372,7 @@ class Connection : public std::enable_shared_from_this<Connection>
     static constexpr int MAX_MISBEHAVIOR = 100;
     bitcoin::Amount feeFilter;
 
-    std::map<uint256, int64_t> requestedInvs;
+    std::unordered_map<uint256, int64_t, bitcoin::SaltedUint256Hasher> requestedInvs;
     std::deque<bitcoin::CInv> invQ;
 
     [[nodiscard]]
@@ -556,7 +567,7 @@ void ConnMgr::rm(Id id) {
 
 bool ConnMgr::AddTxnToFakeMempool_nolock(Net net, const CTransactionRef &tx, bool pushInvs) {
     const auto &txid = tx->GetHashRef();
-    const auto & [it, inserted] = fakeMempool.try_emplace(std::ref(txid), std::tuple(Tic{}, net, tx));
+    const auto & [it, inserted] = fakeMempool.try_emplace(std::ref(txid), Tic{}, net, tx);
     if (inserted)  {
         haveInvs.insert(tx->GetHashRef());
         if (pushInvs) {
