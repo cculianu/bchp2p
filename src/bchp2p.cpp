@@ -5,6 +5,7 @@
 #include "bitcoin/hash.h"
 #include "bitcoin/logging.h"
 #include "bitcoin/protocol.h"
+#include "bitcoin/random.h"
 #include "bitcoin/streams.h"
 #include "bitcoin/sync.h"
 #include "bitcoin/random.h"
@@ -860,9 +861,18 @@ async<> Connection::DoOnceIfAfterHandshake() {
             uint64_t const nCMPCTBLOCKVersion = 1;
             co_await Send(NetMsgType::SENDCMPCT, fAnnounceUsingCMPCTBLOCK, nCMPCTBLOCKVersion); // testing!
         }
-        if (const auto invs2Spam = mgr->GetInvsToSpam(); invs2Spam.empty())
+        if (const auto invs2Spam = mgr->GetInvsToSpam(); invs2Spam.empty()) {
             co_await Send(NetMsgType::MEMPOOL); // testing!
-        else {
+            /* testing that Core disclosure bug...
+            std::vector<CInv> invs;
+            invs.reserve(MAX_INV_SZ); // 50,000
+            FastRandomContext ctx;
+            for (size_t i = 0; i < size_t(MAX_INV_SZ); ++i) {
+                invs.emplace_back(GetDataMsg::MSG_BLOCK, ctx.rand256());
+            }
+            co_await Send(NetMsgType::INV, invs); // testing!
+            */
+        } else {
             // spam txns mode, enqueue all the invs from ConnMgr
             invQ.insert(invQ.end(), invs2Spam.begin(), invs2Spam.end());
         }
