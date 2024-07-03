@@ -228,11 +228,13 @@ public:
         return AddTxnToFakeMempool_nolock(net, tx, pushInvs);
     }
 
-    bool ProcessBlock(Net net, const uint256 &hash, const CBlock &blk) {
+    bool ProcessBlock(Net net, const uint256 &hash, std::shared_ptr<const CBlock> pblk) {
+        if (!pblk) return false;
         LOCK(mut);
         if (haveInv_nolock(hash)) return false;
         haveInvs.insert(hash);
         size_t nRemoved{};
+        auto & blk = *pblk;
         for (const auto &tx : blk.vtx) {
             if (auto it = fakeMempool.find(tx->GetHashRef());
                     it != fakeMempool.end() && (get<1>(it->second) == net || get<1>(it->second) == Net::AnyNet)) {
@@ -415,16 +417,16 @@ class Connection : public std::enable_shared_from_this<Connection>
 
     void Misbehaving(int score, std::string_view msg);
 
-    asio::steady_timer pinger, cleaner, spamInvs;
+    asio::steady_timer pinger, cleaner, invSendTimer;
 
     [[nodiscard]]
     async<> CancelProcessing() {
         Debug("{}: Canceling processing ...\n", GetInfoStr());
         disconnectRequested = true;
-        asio::error_code ec;
+        asio::error_code ec{};
         pinger.cancel(ec);
         cleaner.cancel(ec);
-        spamInvs.cancel(ec);
+        invSendTimer.cancel(ec);
         Debug("{}: shutdown ...\n", GetInfoStr());
         sock.shutdown(sock.shutdown_both, ec);
         auto e = co_await this_coro::executor;
@@ -475,7 +477,7 @@ protected:
     Connection(ConnMgr *mgr, tcp::socket &&sock_, bool inbound_, Net net_, std::string_view infoName_)
         : mgr(mgr), sock(std::move(sock_)), write_lock(sock.get_executor(), 1), inbound(inbound_), net(net_),
           params(netChainParams.at(net)), infoName(infoName_), nLocalNonce(bitcoin::GetRand64()),
-          pinger(sock.get_executor()), cleaner(sock.get_executor()), spamInvs(sock.get_executor())
+          pinger(sock.get_executor()), cleaner(sock.get_executor()), invSendTimer(sock.get_executor())
     {
         bitcoin::CService srv;
         auto ep2srv = [](const tcp::endpoint &ep) {
@@ -518,6 +520,8 @@ public:
     bool IsInbound() const { return inbound; }
 
     Net GetNet() const { return net; }
+
+    void PushInv(bitcoin::GetDataMsg type, const uint256 &hash);
 };
 
 std::shared_ptr<Connection> ConnMgr::CreateConnection(tcp::socket &&sock, bool inbound, Net net, std::string_view infoName = {})
@@ -559,11 +563,17 @@ bool ConnMgr::AddTxnToFakeMempool_nolock(Net net, const CTransactionRef &tx, boo
             for (const auto & [id, wptr] : conns) {
                 auto conn = wptr.lock();
                 if (!conn || (net != Net::AnyNet && conn->GetNet() != net) || conn->peerHasInvs.contains(tx->GetHashRef())) continue;
-                conn->invQ.emplace_back(bitcoin::MSG_TX, tx->GetHashRef());
+                conn->PushInv(bitcoin::MSG_TX, tx->GetHashRef());
             }
         }
     }
     return inserted;
+}
+
+void Connection::PushInv(bitcoin::GetDataMsg type, const uint256 &hash)
+{
+    invQ.emplace_back(type, hash);
+    invSendTimer.cancel_one();
 }
 
 async<> Connection::SendVersion()
@@ -996,7 +1006,8 @@ async<> Connection::HandleTx(bitcoin::CSerializedNetMsg && msg)
 async<> Connection::HandleBlock(bitcoin::CSerializedNetMsg && msg)
 {
     using namespace bitcoin;
-    CBlock blk;
+    auto pblk = std::make_shared<CBlock>();
+    CBlock & blk = *pblk;
     MakeReader(msg) >> blk;
     const auto hash = blk.GetHash();
 
@@ -1009,7 +1020,7 @@ async<> Connection::HandleBlock(bitcoin::CSerializedNetMsg && msg)
         elapsedMSec = (GetTimeMicros() - it->second) / 1e3;
         requestedInvs.erase(it);
     }
-    if (mgr->ProcessBlock(GetNet(), hash, blk)) {
+    if (mgr->ProcessBlock(GetNet(), hash, pblk)) {
         auto ins_n_outs = std::pair<size_t, size_t>(0U, 0U);
         ins_n_outs = std::accumulate(blk.vtx.begin(), blk.vtx.end(), ins_n_outs,
                                      [](const auto &accum, const auto &tx){
@@ -1209,14 +1220,38 @@ async<> Connection::Cleaner()
 async<> Connection::InvSender()
 {
     using namespace bitcoin;
+    static constexpr bool verbose = false;
     Debug("{}: InvSender started", GetInfoStr());
     Defer d([&]{ Debug("{}: InvSender stopped", GetInfoStr()); });
-    auto Wait  = [&](unsigned msecs = 100) -> async<> {
-        spamInvs.expires_from_now(std::chrono::milliseconds{msecs});
-        co_await spamInvs.async_wait(use_awaitable);
+    auto Wait = [&](int64_t msecs, bool ignoreCancelation = false) -> async<bool> {
+        Tic t0;
+        bool again;
+        do {
+            again = false;
+            invSendTimer.expires_from_now(std::chrono::milliseconds{msecs});
+            try {
+                co_await invSendTimer.async_wait(use_awaitable);
+            } catch (const asio::system_error &e) {
+                if (e.code().value() == asio::error::basic_errors::operation_aborted) {
+                    // canceled (maybe by a PushInv() call).
+                    msecs -= t0.msec<int64_t>();
+                    if (ignoreCancelation) {
+                        // ignoring cancelation, keep waiting ...
+                        if constexpr (verbose) Debug("{}: Ignoring cancelation, still have {} msecs left to wait ...", GetInfoStr(), msecs);
+                        again = true;
+                        continue;
+                    }
+                    if constexpr (verbose) Debug("{}: Responding to cancelation, still had {} msecs left", GetInfoStr(), msecs);
+                    co_return false;
+                }
+                // other error, bubble it out
+                throw;
+            }
+        } while(again && msecs > 0);
+        co_return true;
     };
     while (!isFullyConnected()) {
-        co_await Wait();
+        co_await Wait(100);
         if (disconnectRequested) co_return;
     }
 
@@ -1231,12 +1266,17 @@ async<> Connection::InvSender()
             invs.insert(invs.end(), invQ.begin(), endit);
             invQ.erase(invQ.begin(), endit);
             const auto sent = invs.size();
-            Debug("{}: {} sending {} invs ...", GetInfoStr(), __func__, invs.size());
+            if constexpr (verbose) Debug("{}: {} sending {} invs ...", GetInfoStr(), __func__, invs.size());
             co_await Send(bitcoin::NetMsgType::INV, std::move(invs));
             invs.clear();
-            co_await Wait(10 * sent);
+            co_await Wait(10 * sent, true);
         } else {
-            co_await Wait(10u);
+            Tic t0;
+            const bool expired [[maybe_unused]] =
+                /* wake up every 1 min, but may be "cancelled" to wakeup early if PushInv() is called */
+                co_await Wait(60LL * 1000LL);
+            if constexpr (verbose)
+                Debug("{}: {} woke up after {} msec, timer {}", GetInfoStr(), __func__, t0.msecStr(), expired ? "expired." : "woke up early!");
         }
     }
 }
