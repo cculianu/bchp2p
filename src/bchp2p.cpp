@@ -17,6 +17,7 @@
 #include "util.h"
 
 #include <asio.hpp>
+#include <asio/experimental/channel.hpp>
 #include <boost/algorithm/string.hpp>
 #include <boost/range/adaptors.hpp>
 #include <fmt/chrono.h>
@@ -53,6 +54,7 @@ using asio::awaitable;
 using asio::co_spawn;
 using asio::detached;
 using asio::use_awaitable;
+using chan_void = asio::experimental::channel<void()>;
 namespace this_coro = asio::this_coro;
 
 template <typename T = void, typename E = asio::any_io_executor>
@@ -334,6 +336,7 @@ class Connection : public std::enable_shared_from_this<Connection>
     ConnMgr * const mgr;
     const Id id = GetNewId();
     tcp::socket sock;
+    chan_void write_lock;
     bitcoin::CAddress local, remote;
     const bool inbound;
     const Net net;
@@ -470,9 +473,9 @@ class Connection : public std::enable_shared_from_this<Connection>
 protected:
     friend ConnMgr;
     Connection(ConnMgr *mgr, tcp::socket &&sock_, bool inbound_, Net net_, std::string_view infoName_)
-        : mgr(mgr), sock(std::move(sock_)), inbound(inbound_), net(net_), params(netChainParams.at(net)),
-          infoName(infoName_), nLocalNonce(bitcoin::GetRand64()), pinger(sock.get_executor()),
-          cleaner(sock.get_executor()), spamInvs(sock.get_executor())
+        : mgr(mgr), sock(std::move(sock_)), write_lock(sock.get_executor(), 1), inbound(inbound_), net(net_),
+          params(netChainParams.at(net)), infoName(infoName_), nLocalNonce(bitcoin::GetRand64()),
+          pinger(sock.get_executor()), cleaner(sock.get_executor()), spamInvs(sock.get_executor())
     {
         bitcoin::CService srv;
         auto ep2srv = [](const tcp::endpoint &ep) {
@@ -595,10 +598,10 @@ async<> Connection::Send(bitcoin::CSerializedNetMsg msg)
 {
     using namespace bitcoin;
     CMessageHeader hdr(params.netMagic, msg); // construct valid header with checksum
-    std::vector<uint8_t> outdata;
-    outdata.reserve(CMessageHeader::HEADER_SIZE + msg.data.size());
-    VectorWriter(SER_NETWORK, PROTOCOL_VERSION, outdata, 0) << hdr;
-    const size_t msgSize = outdata.size() + msg.data.size();
+    std::vector<uint8_t> hdrData;
+    hdrData.reserve(CMessageHeader::HEADER_SIZE);
+    VectorWriter(SER_NETWORK, PROTOCOL_VERSION, hdrData, 0) << hdr;
+    const size_t msgSize = hdrData.size() + msg.data.size();
     const auto cmd = hdr.GetCommand();
     Log("{}: Sending msg {} {} bytes\n", GetInfoStr(), cmd, msgSize);
     const auto ncmd = NetMsgType::Normalize(cmd); // assumption: Normalize() returns a long-lived string_view!
@@ -608,10 +611,14 @@ async<> Connection::Send(bitcoin::CSerializedNetMsg msg)
     ++msgsOut;
     Tic t0;
     {
-        // NB: we must do it this way to ensure serialized access to the socket.. so we must write as 1 write not 2
-        outdata.insert(outdata.end(), msg.data.begin(), msg.data.end()); // concatenate header + payload
-        msg.data = std::vector<uint8_t>{}; // release memory
-        co_await asio::async_write(sock, asio::buffer(outdata), use_awaitable);
+        // NB: We must do it this way to ensure serialized access to the socket.. using a channel to "fake" an async
+        // mutex. Claim the write lock by sending a message to the channel. Since the channel signature is void(),
+        // there are no arguments to send in the message itself.
+        co_await write_lock.async_send(asio::deferred);
+        co_await asio::async_write(sock, asio::buffer(hdrData), use_awaitable);
+        co_await asio::async_write(sock, asio::buffer(msg.data), use_awaitable);
+        // Release the lock by receiving the message back again.
+        write_lock.try_receive([](auto...){});
     }
     Debug("{}: {} msec for '{}' xfer\n", GetInfoStr(), t0.msecStr(), ncmd);
 }
