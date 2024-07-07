@@ -1290,7 +1290,7 @@ async<> Connection::InvSender()
             if constexpr (verbose) Debug("{}: {} sending {} invs ...", GetInfoStr(), __func__, invs.size());
             co_await Send(bitcoin::NetMsgType::INV, std::move(invs));
             invs.clear();
-            co_await Wait(10 * sent, true);
+            co_await Wait(3 * sent, true); // TODO: tune this!
         } else {
             Tic t0;
             const bool expired [[maybe_unused]] =
