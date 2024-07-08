@@ -166,10 +166,13 @@ private:
     struct FakeMempoolEntry {
         Tic tic;
         Net net;
+        bool isSpamTxn = false;
+        mutable std::atomic_uint32_t sendCt{0u};
         CTransactionRef tx;
 
         FakeMempoolEntry() = default;
-        FakeMempoolEntry(const Tic &t, const Net n, const CTransactionRef &tx_) : tic{t}, net{n}, tx{tx_} {}
+        FakeMempoolEntry(const Tic &t, const Net n, const CTransactionRef &tx_, bool isSpam = false)
+            : tic{t}, net{n}, isSpamTxn{isSpam}, tx{tx_} {}
     };
 
     template <typename T>
@@ -178,14 +181,16 @@ private:
     std::unordered_map<Ref<const uint256>, FakeMempoolEntry, bitcoin::SaltedUint256Hasher>
         fakeMempool GUARDED_BY(mut);
 
-    CTransactionRef GetTxn_nolock(const Net net, const uint256 &txid) const SHARED_LOCKS_REQUIRED(mut) {
+    std::tuple<CTransactionRef, std::atomic_uint32_t *, bool>
+    GetTxn_nolock(const Net net, const uint256 &txid) const SHARED_LOCKS_REQUIRED(mut) {
         if (auto it = fakeMempool.find(txid); it != fakeMempool.end())
             if (net == Net::AnyNet || it->second.net == Net::AnyNet || it->second.net == net)
-                return it->second.tx;
-        return {};
+                return {it->second.tx, &it->second.sendCt, it->second.isSpamTxn};
+        return {{}, nullptr, false};
     }
 
-    bool AddTxnToFakeMempool_nolock(Net net, const CTransactionRef &tx, bool pushInvs) EXCLUSIVE_LOCKS_REQUIRED(mut);
+    bool AddTxnToFakeMempool_nolock(Net net, const CTransactionRef &tx, bool pushInvs, bool isSpam = false)
+        EXCLUSIVE_LOCKS_REQUIRED(mut);
 
 public:
     ConnMgr(std::vector<CTransactionRef> txns2Spam = {});
@@ -228,16 +233,16 @@ public:
 
     UniValue::Object GetStats() const;
 
-    CTransactionRef GetTxn(Net net, const uint256 &txid) const {
+    std::tuple<CTransactionRef, std::atomic_uint32_t *, bool> GetTxn(Net net, const uint256 &txid) const {
         LOCK_SHARED(mut);
         return GetTxn_nolock(net, txid);
     }
 
     std::vector<bitcoin::CInv> GetInvsToSpam(); /* intentionally non-const since it may clear/delete/maintain invs2Spam */
 
-    bool AddTxnToFakeMempool(Net net, const CTransactionRef &tx, bool pushInvs = true) {
+    bool AddTxnToFakeMempool(Net net, const CTransactionRef &tx, bool pushInvs = true, bool isSpam = false) {
         LOCK(mut);
-        return AddTxnToFakeMempool_nolock(net, tx, pushInvs);
+        return AddTxnToFakeMempool_nolock(net, tx, pushInvs, false);
     }
 
     bool ProcessBlock(Net net, const uint256 &hash, std::shared_ptr<const CBlock> pblk) {
@@ -280,7 +285,7 @@ ConnMgr::ConnMgr(std::vector<CTransactionRef> txns2Spam) {
 
     LOCK(mut);
     for (const auto &tx : txns2Spam)
-        if (AddTxnToFakeMempool_nolock(Net::AnyNet, tx, false))
+        if (AddTxnToFakeMempool_nolock(Net::AnyNet, tx, false, true))
             invs2Spam.emplace_back(bitcoin::MSG_TX, tx->GetHashRef());
 }
 
@@ -300,7 +305,7 @@ async<> ConnMgr::cleanFakeMempool()
 {
     Debug("{}: started", __func__);
     Defer d([f=std::string_view{__func__}]{ Debug("{}: stopped", f); });
-    constexpr int cleanTime = 20 * 60; /* 20 mins */
+    constexpr int cleanTime = 30 * 60; /* 30 mins */
     while (!cancelled) {
         cleaner.expires_from_now(std::chrono::seconds{cleanTime / 2});
         co_await cleaner.async_wait(use_awaitable);
@@ -310,7 +315,7 @@ async<> ConnMgr::cleanFakeMempool()
         {
             LOCK(mut);
             for (auto it = fakeMempool.begin(); it != fakeMempool.end(); /**/) {
-                if (it->second.tic.secs<int64_t>() >= cleanTime) {
+                if (it->second.tic.secs<int64_t>() >= cleanTime && (!it->second.isSpamTxn || it->second.sendCt > 0u)) {
                     it = fakeMempool.erase(it);
                     ++nDeleted;
                 } else
@@ -438,6 +443,7 @@ class Connection : public std::enable_shared_from_this<Connection>
         asio::error_code ec{};
         pinger.cancel(ec);
         cleaner.cancel(ec);
+        write_lock.cancel();
         invSendTimer.cancel(ec);
         Debug("{}: shutdown ...\n", GetInfoStr());
         sock.shutdown(sock.shutdown_both, ec);
@@ -566,11 +572,11 @@ void ConnMgr::rm(Id id) {
     }
 }
 
-bool ConnMgr::AddTxnToFakeMempool_nolock(Net net, const CTransactionRef &tx, bool pushInvs) {
+bool ConnMgr::AddTxnToFakeMempool_nolock(Net net, const CTransactionRef &tx, bool pushInvs, bool isSpam) {
     const auto &txid = tx->GetHashRef();
-    const auto & [it, inserted] = fakeMempool.try_emplace(std::ref(txid), Tic{}, net, tx);
+    const auto & [it, inserted] = fakeMempool.try_emplace(std::ref(txid), Tic{}, net, tx, isSpam);
     if (inserted)  {
-        haveInvs.insert(tx->GetHashRef());
+        haveInvs.insert(txid);
         if (pushInvs) {
             for (const auto & [id, wptr] : conns) {
                 auto conn = wptr.lock();
@@ -672,6 +678,7 @@ async<> Connection::ProcessLoop()
             Hdr hdr({});
             GenericVectorReader(SER_NETWORK, protoVersion, headerbuf, 0) >> hdr;
             if (!hdr.IsValid(params.netMagic)) throw ProtocolError("Bad header");
+            if (hdr.IsOversized()) throw ProtocolError("Oversized message");
             CSerializedNetMsg msg;
             msg.m_type = hdr.GetCommand();
             msg.data.resize(hdr.nMessageSize);
@@ -1165,13 +1172,15 @@ async<> Connection::HandleGetData(bitcoin::CSerializedNetMsg && msg)
         const auto & hash = inv.hash;
         bool found = false;
         if (inv.IsTx()) {
-            if (auto tx = mgr->GetTxn(GetNet(), hash)) {
+            if (auto [tx, pctr, isSpam] = mgr->GetTxn(GetNet(), hash); tx) {
                 found = true;
                 if (Debug::enabled)
-                    Debug("{}: Sending tx {} ({} bytes) ...", GetInfoStr(),
+                    Debug("{}: Sending tx {}{} ({} bytes) ...", GetInfoStr(),
                           styled(tx->GetHashRef().ToString(), fg(Color::green)|fmt::emphasis::italic),
+                          !isSpam ? std::string{} : fmt::format(" {}", styled("spam", fg(Color::white)|bg(Color::magenta))),
                           styled(tx->GetTotalSize(), fg(Color::bright_yellow)|fmt::emphasis::bold));
                 co_await Send(NetMsgType::TX, *tx);
+                if (pctr) pctr->fetch_add(1);
                 peerHasInvs.insert(tx->GetHashRef());
             }
         } else {
@@ -1290,7 +1299,7 @@ async<> Connection::InvSender()
             if constexpr (verbose) Debug("{}: {} sending {} invs ...", GetInfoStr(), __func__, invs.size());
             co_await Send(bitcoin::NetMsgType::INV, std::move(invs));
             invs.clear();
-            co_await Wait(3 * sent, true); // TODO: tune this!
+            co_await Wait(1 * sent, true); // TODO: tune this!
         } else {
             Tic t0;
             const bool expired [[maybe_unused]] =
