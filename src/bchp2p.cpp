@@ -189,7 +189,8 @@ private:
         return {{}, nullptr, false};
     }
 
-    bool AddTxnToFakeMempool_nolock(Net net, const CTransactionRef &tx, bool pushInvs, bool isSpam = false)
+    std::pair<bool, size_t>
+    AddTxnToFakeMempool_nolock(Net net, const CTransactionRef &tx, bool pushInvs, bool isSpam = false)
         EXCLUSIVE_LOCKS_REQUIRED(mut);
 
 public:
@@ -240,7 +241,8 @@ public:
 
     std::vector<bitcoin::CInv> GetInvsToSpam(); /* intentionally non-const since it may clear/delete/maintain invs2Spam */
 
-    bool AddTxnToFakeMempool(Net net, const CTransactionRef &tx, bool pushInvs = true, bool isSpam = false) {
+    std::pair<bool, size_t>
+    AddTxnToFakeMempool(Net net, const CTransactionRef &tx, bool pushInvs = true, bool isSpam = false) {
         LOCK(mut);
         return AddTxnToFakeMempool_nolock(net, tx, pushInvs, false);
     }
@@ -259,7 +261,8 @@ public:
                 ++nRemoved;
             }
         }
-        if (nRemoved) Log("{}: Removed {} txns from fakeMempool that appear in block {}", __func__, nRemoved, hash.ToString());
+        if (nRemoved) Log("{}: Removed {} txns from fakeMempool that appear in block {}, poolsz now: {}",
+                          __func__, nRemoved, hash.ToString(), fakeMempool.size());
         return true;
     }
 
@@ -285,7 +288,7 @@ ConnMgr::ConnMgr(std::vector<CTransactionRef> txns2Spam) {
 
     LOCK(mut);
     for (const auto &tx : txns2Spam)
-        if (AddTxnToFakeMempool_nolock(Net::AnyNet, tx, false, true))
+        if (AddTxnToFakeMempool_nolock(Net::AnyNet, tx, false, true).first)
             invs2Spam.emplace_back(bitcoin::MSG_TX, tx->GetHashRef());
 }
 
@@ -572,7 +575,8 @@ void ConnMgr::rm(Id id) {
     }
 }
 
-bool ConnMgr::AddTxnToFakeMempool_nolock(Net net, const CTransactionRef &tx, bool pushInvs, bool isSpam) {
+std::pair<bool, size_t>
+ConnMgr::AddTxnToFakeMempool_nolock(Net net, const CTransactionRef &tx, bool pushInvs, bool isSpam) {
     const auto &txid = tx->GetHashRef();
     const auto & [it, inserted] = fakeMempool.try_emplace(std::ref(txid), Tic{}, net, tx, isSpam);
     if (inserted)  {
@@ -585,7 +589,7 @@ bool ConnMgr::AddTxnToFakeMempool_nolock(Net net, const CTransactionRef &tx, boo
             }
         }
     }
-    return inserted;
+    return {inserted, fakeMempool.size()};
 }
 
 void Connection::PushInv(bitcoin::GetDataMsg type, const uint256 &hash)
@@ -1022,10 +1026,10 @@ async<> Connection::HandleTx(bitcoin::CSerializedNetMsg && msg)
         elapsedMSec = (GetTimeMicros() - it->second) / 1e3;
         requestedInvs.erase(it);
     }
-    if (mgr->AddTxnToFakeMempool(GetNet(), tx))
-        Debug("{}: Got TX reply in {:1.3f} msec. txid: {}, size: {}, version: {}, nins: {}, nouts: {}",
+    if (auto [inserted, poolsz] = mgr->AddTxnToFakeMempool(GetNet(), tx); inserted)
+        Debug("{}: Got TX reply in {:1.3f} msec. txid: {}, size: {}, version: {}, nins: {}, nouts: {}, poolsz: {}",
               GetInfoStr(), elapsedMSec, tx->GetHashRef().ToString(), tx->GetTotalSize(), tx->nVersion,
-              tx->vin.size(), tx->vout.size());
+              tx->vin.size(), tx->vout.size(), poolsz);
     else
         Debug("{}: Got TX reply in {:1.3f} msec. txid: {}; already have tx",
               GetInfoStr(), elapsedMSec, tx->GetHashRef().ToString());
