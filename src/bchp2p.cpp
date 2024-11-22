@@ -100,22 +100,30 @@ struct ChainParams
     std::pair<uint32_t, uint256> mostRecentCheckpoint;
 };
 
-enum Net : uint8_t { Main = 0, Chip, Test3, Test4, Scale, Reg, NumNets, AnyNet = 0xffu /* special value! */ };
+enum Net : uint8_t { Main = 0, Chip, Test3, Test4, Scale, Reg, BtcMain, BtcTest3, BtcTest4,
+                     NumNets, AnyNet = 0xffu /* special value! */ };
 
 const std::array<ChainParams, NumNets> netChainParams = {
     // NB: these should be in the same order as the `Net` enum above
     ChainParams{ .name = "Main", .netMagic = {0xe3, 0xe1, 0xf3, 0xe8},
-                 .mostRecentCheckpoint = {847762,  uint256S("0000000000000000010d0029ada78decbe529c1376ffc43466a28f5e585753ce")}},
+                 .mostRecentCheckpoint = {847'762,   uint256S("0000000000000000010d0029ada78decbe529c1376ffc43466a28f5e585753ce")}},
     ChainParams{ .name = "Chip", .netMagic = {0xe2, 0xb7, 0xda, 0xaf},
-                 .mostRecentCheckpoint = {200607,  uint256S("000000005b2192ec61f1089479ab90993896e31642ba24ae6948f913084c5ea5")}},
+                 .mostRecentCheckpoint = {200'607,   uint256S("000000005b2192ec61f1089479ab90993896e31642ba24ae6948f913084c5ea5")}},
     ChainParams{ .name = "Test3", .netMagic = {0xf4, 0xe5, 0xf3, 0xf4},
-                 .mostRecentCheckpoint = {1605521, uint256S("000000000000007d4c561056e9bcb3ab7591d024b18fff4bc27cca4d51d4780e")}},
+                 .mostRecentCheckpoint = {1'605'521, uint256S("000000000000007d4c561056e9bcb3ab7591d024b18fff4bc27cca4d51d4780e")}},
     ChainParams{ .name = "Test4", .netMagic = {0xe2, 0xb7, 0xda, 0xaf},
-                 .mostRecentCheckpoint = {200741,  uint256S("0000000007d8ccbb767c269551dd81c520463066bec8654a18f4106aa53dc816")}},
+                 .mostRecentCheckpoint = {200'741,   uint256S("0000000007d8ccbb767c269551dd81c520463066bec8654a18f4106aa53dc816")}},
     ChainParams{ .name = "Scale", .netMagic = {0xc3, 0xaf, 0xe1, 0xa2},
-                 .mostRecentCheckpoint = {10000,   uint256S("00000000b711dc753130e5083888d106f99b920b1b8a492eb5ac41d40e482905")}},
+                 .mostRecentCheckpoint = {10'000,    uint256S("00000000b711dc753130e5083888d106f99b920b1b8a492eb5ac41d40e482905")}},
     ChainParams{ .name = "Reg",   .netMagic = {0xda, 0xb5, 0xbf, 0xfa},
-                 .mostRecentCheckpoint = {0,       uint256S("0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206")}},
+                 .mostRecentCheckpoint = {0,         uint256S("0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206")}},
+    /* BTC */
+    ChainParams{ .name = "BtcMain",  .netMagic = {0xf9, 0xbe, 0xb4, 0xd9},
+                 .mostRecentCheckpoint = {840'000,   uint256S("0000000000000000000320283a032748cef8227873ff4872689bf23f1cda83a5")}},
+    ChainParams{ .name = "BtcTest3", .netMagic = {0x0b, 0x11, 0x09, 0x07},
+                 .mostRecentCheckpoint = {2'500'000, uint256S("0000000000000093bcb68c03a9a168ae252572d348a2eaeba2cdf9231d73206f")}},
+    ChainParams{ .name = "BtcTest4", .netMagic = {0x1c, 0x16, 0x3f, 0x28},
+                .mostRecentCheckpoint = {50'000,     uint256S("00000000e2c8c94ba126169a88997233f07a9769e2b009fb10cad0e893eff2cb")}},
 };
 
 std::string_view Net2Name(Net net) {
@@ -873,7 +881,8 @@ async<> Connection::DoOnceIfAfterHandshake() {
             co_await Send(NetMsgType::SENDCMPCT, fAnnounceUsingCMPCTBLOCK, nCMPCTBLOCKVersion); // testing!
         }
         if (const auto invs2Spam = mgr->GetInvsToSpam(); invs2Spam.empty()) {
-            co_await Send(NetMsgType::MEMPOOL); // testing!
+            if (!cleanSubVer.starts_with("/Satoshi:")) // Core nodes reject us if we send MEMPOOL without a bloom filter set
+                co_await Send(NetMsgType::MEMPOOL); // testing!
             /* testing that Core disclosure bug...
             std::vector<CInv> invs;
             invs.reserve(MAX_INV_SZ); // 50,000
