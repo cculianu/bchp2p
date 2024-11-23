@@ -273,7 +273,13 @@ extern const std::string_view EXTVERSION;
  * Double spend proof
  */
 extern const std::string_view DSPROOF;
-
+/**
+ * --- BTC ONLY ---
+ * Indicates that a node prefers to relay transactions via wtxid, rather than
+ * txid.
+ * @since protocol version 70016 as described by BIP 339.
+ */
+extern const std::string_view WTXIDRELAY;
 
 /**
  * Indicate if the message is used to transmit the content of a block.
@@ -309,8 +315,10 @@ enum ServiceFlags : uint64_t {
     // advertising this bit, but no longer do as of protocol version 70011 (=
     // NO_BLOOM_VERSION)
     NODE_BLOOM = (1 << 2),
-    // Used by BTC to indicate it can see segwit
+
+    // **BTC ONLY** Indicates node can parse/use segwit data.
     NODE_WITNESS = (1 << 3),
+
     // NODE_XTHIN means the node supports Xtreme Thinblocks. If this is turned
     // off then the node will not service nor make xthin requests.
     NODE_XTHIN = (1 << 4),
@@ -325,6 +333,12 @@ enum ServiceFlags : uint64_t {
     // If this is turned off then the node will not service graphene requests nor
     // make graphene requests
     NODE_GRAPHENE = (1 << 6),
+
+    // **BTC ONLY**
+    // NODE_COMPACT_FILTERS means the node will service basic block filter requests.
+    // See BIP157 and BIP158 for details on how this is implemented.
+    NODE_COMPACT_FILTERS = (1 << 6),
+
     // NODE_CF means that the node supports BIP 157/158 style
     // compact filters on block data
     NODE_CF = (1 << 8),
@@ -335,6 +349,9 @@ enum ServiceFlags : uint64_t {
 
     // indicates if node is using extversion
     NODE_EXTVERSION = (1 << 11),
+
+    // **BTC ONLY** NODE_P2P_V2 means the node supports BIP324 transport
+    NODE_P2P_V2 = (1 << 11),
 
     // The last non experimental service bit, helper for looping over the flags
     NODE_LAST_NON_EXPERIMENTAL_SERVICE_BIT = (1 << 23),
@@ -347,6 +364,13 @@ enum ServiceFlags : uint64_t {
     // do not actually support. Other service bits should be allocated via the
     // BIP process.
 };
+
+/**
+ * Convert service flags (a bitmask of NODE_*) to human readable strings.
+ * It supports unknown service flags which will be returned as "UNKNOWN[2^n]".
+ * @param[in] flags multiple NODE_* bitwise-OR-ed together
+ */
+std::vector<std::string> ServiceFlagsToStrVec(uint64_t flags, bool btc = false);
 
 /**
  * Gets the set of service flags which are "desirable" for a given peer.

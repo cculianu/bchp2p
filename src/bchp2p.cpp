@@ -153,6 +153,8 @@ std::optional<Net> Name2Net(std::string_view name, bool caseSensitive = false) {
     return std::nullopt;
 }
 
+constexpr bool IsNetBtc(const Net net) noexcept { return net == BtcMain || net == BtcTest3 || net == BtcTest4; }
+
 using Id = uint64_t;
 
 inline Id GetNewId() {
@@ -429,6 +431,7 @@ class Connection : public std::enable_shared_from_this<Connection>
     [[nodiscard]] async<> HandleHeaders(bitcoin::CSerializedNetMsg && msg);
     [[nodiscard]] async<> HandleReject(bitcoin::CSerializedNetMsg && msg);
     [[nodiscard]] async<> HandleGetData(bitcoin::CSerializedNetMsg && msg);
+    [[nodiscard]] async<> HandleWtxidRelay(bitcoin::CSerializedNetMsg && msg);
 
     [[nodiscard]] async<> DoOnceIfAfterHandshake(); // does GETADDR, etc -- stuff we do immediately after a state change to "fully established"
     [[nodiscard]] async<> InvSender();
@@ -507,8 +510,8 @@ class Connection : public std::enable_shared_from_this<Connection>
     const uint256 & GetCheckpointHash() const { return params.mostRecentCheckpoint.second; }
 
     bitcoin::ServiceFlags makeLocalServiceFlags() const {
-        uint64_t ret = bitcoin::NODE_NETWORK|bitcoin::NODE_BLOOM;
-        if (net == BtcMain || net == BtcTest3 || net == BtcTest4)
+        uint64_t ret = bitcoin::NODE_NETWORK|bitcoin::NODE_BLOOM|bitcoin::NODE_NETWORK_LIMITED;
+        if (IsNetBtc(net))
             ret |= bitcoin::NODE_WITNESS; // enable witness for BTC
         else
             ret |= bitcoin::NODE_BITCOIN_CASH; // BCH
@@ -803,10 +806,16 @@ async<> Connection::MsgHandler(bitcoin::CSerializedNetMsg && msg)
             co_return co_await HandleReject(std::move(msg));
         }
 
+        if (ncmd == NetMsgType::WTXIDRELAY) {
+            co_return co_await HandleWtxidRelay(std::move(msg));
+        }
+
     } catch (const std::ios_base::failure &e) {
         Warning("{}: Unserialize error processing message: '{}', exception was: {}", GetInfoStr(), ncmd, e.what());
         Misbehaving(1, "unserialize-error");
     }
+
+    co_return;
 }
 
 async<> Connection::HandleVersion(bitcoin::CSerializedNetMsg && msg)
@@ -1263,6 +1272,14 @@ async<> Connection::HandleGetData(bitcoin::CSerializedNetMsg && msg)
     co_return;
 }
 
+async<> Connection::HandleWtxidRelay(bitcoin::CSerializedNetMsg && msg)
+{
+    if (!IsNetBtc(net))
+        Warning("{}: Got WTXIDRELAY message from a non-BTC net peer", GetInfoStr());
+    Debug("{}: Ignoring unsupported WTXIDRELAY message", GetInfoStr());
+    co_return;
+}
+
 async<> Connection::Pinger()
 {
     using namespace bitcoin;
@@ -1389,7 +1406,10 @@ UniValue::Object Connection::GetStats() const
     if (lastPingPongDelta != 0) ret.emplace_back("ping_msec", lastPingPongDelta);
     ret.emplace_back("subver", cleanSubVer);
     ret.emplace_back("version", protoVersion);
-    ret.emplace_back("serviceFlags", fmt::format("{:#011b}", uint64_t(remote.nServices)));
+    ret.emplace_back("local serviceFlags (bits)", fmt::format("{:#011b}", uint64_t(local.nServices)));
+    ret.emplace_back("local serviceFlags (verbose)", boost::join(bitcoin::ServiceFlagsToStrVec(uint64_t(local.nServices), IsNetBtc(net)), ", "));
+    ret.emplace_back("remote serviceFlags (bits)", fmt::format("{:#011b}", uint64_t(remote.nServices)));
+    ret.emplace_back("remote serviceFlags (verbose)", boost::join(bitcoin::ServiceFlagsToStrVec(uint64_t(remote.nServices), IsNetBtc(net)), ", "));
     ret.emplace_back("relay", relay);
     ret.emplace_back("misbehavior", fmt::format("{}/{}", misbehavior, MAX_MISBEHAVIOR));
     ret.emplace_back("startingHeight", startingHeight);

@@ -16,6 +16,8 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
+#include <cstdlib>
 #include <cstring>
 
 #include <string.h> // for strnlen
@@ -56,6 +58,7 @@ const std::string_view GETBLOCKTXN = "getblocktxn"sv;
 const std::string_view BLOCKTXN = "blocktxn"sv;
 const std::string_view EXTVERSION = "extversion"sv;
 const std::string_view DSPROOF = "dsproof-beta"sv;
+const std::string_view WTXIDRELAY = "wtxidrelay"sv;
 
 bool IsBlockLike(std::string_view msg_type) {
     return msg_type == NetMsgType::BLOCK ||
@@ -81,7 +84,7 @@ static const std::vector<std::string_view> allNetMessageTypesVec{{
     NetMsgType::PONG,        NetMsgType::NOTFOUND,   NetMsgType::FILTERLOAD,  NetMsgType::FILTERADD,
     NetMsgType::FILTERCLEAR, NetMsgType::REJECT,     NetMsgType::SENDHEADERS, NetMsgType::FEEFILTER,
     NetMsgType::SENDCMPCT,   NetMsgType::CMPCTBLOCK, NetMsgType::GETBLOCKTXN, NetMsgType::BLOCKTXN,
-    NetMsgType::EXTVERSION,  NetMsgType::DSPROOF,
+    NetMsgType::EXTVERSION,  NetMsgType::DSPROOF,    NetMsgType::WTXIDRELAY,
 }};
 
 CMessageHeader::CMessageHeader(const MessageMagic &pchMessageStartIn) {
@@ -216,4 +219,42 @@ const std::vector<std::string_view> &getAllNetMessageTypes() {
     return allNetMessageTypesVec;
 }
 
+std::vector<std::string> ServiceFlagsToStrVec(uint64_t flags, const bool btc) {
+    auto serviceFlagToStr = [btc](uint8_t bit, ServiceFlags & flag_extracted) -> std::string {
+        /**
+         * Convert a service flag (NODE_*) to a human readable string.
+         * It supports unknown service flags which will be returned as "UNKNOWN[...]".
+         * @param[in] bit the service flag is calculated as (1 << bit)
+         */
+        switch (flag_extracted = static_cast<ServiceFlags>(1ULL << bit)) {
+        case NODE_NONE:            std::abort();  // impossible
+        case NODE_NETWORK:         return "NETWORK";
+        case NODE_GETUTXO:         return "GETUTXO";
+        case NODE_BLOOM:           return "BLOOM";
+        case NODE_WITNESS:         return "WITNESS";
+        case NODE_XTHIN:           return "XTHIN";
+        case NODE_BITCOIN_CASH:    return "BITCION_CASH";
+        case NODE_GRAPHENE:        return btc ? "COMPACT_FILTERS" : "GRAPHENE"; // on btc this is NODE_COMPACT_FILTERS
+        case NODE_CF:              return "CF";
+        case NODE_NETWORK_LIMITED: return "NETWORK_LIMITED";
+        case NODE_EXTVERSION:      return btc ? "P2P_V2" : "EXTVERSION";
+        case NODE_LAST_NON_EXPERIMENTAL_SERVICE_BIT: break;
+            // Not using default, so we get warned when a case is missing
+        }
+        return strprintf("UNKNOWN[2^%u]", bit);
+    };
+
+    std::vector<std::string> ret;
+    constexpr size_t maxbits = sizeof(flags) * 8u;
+
+    if (const auto nbits = std::min<size_t>(std::popcount(flags), maxbits)) {
+        ret.reserve(nbits);
+        ServiceFlags extracted_flag;
+        for (uint8_t bit; (bit = std::countr_zero(flags)) < maxbits; flags &= ~extracted_flag) {
+            ret.push_back(serviceFlagToStr(bit, extracted_flag));
+        }
+    }
+
+    return ret;
+}
 } // namespace bitcoin
