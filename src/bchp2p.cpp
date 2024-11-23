@@ -255,7 +255,7 @@ public:
         return AddTxnToFakeMempool_nolock(net, tx, pushInvs, false);
     }
 
-    bool ProcessBlock(Net net, const uint256 &hash, std::shared_ptr<const CBlock> pblk) {
+    bool ProcessBlock(Net net, const uint256 &hash, std::shared_ptr<const CBlock> pblk, bool *hasWitness = nullptr) {
         if (!pblk) return false;
         LOCK(mut);
         if (haveInv_nolock(hash)) return false;
@@ -263,6 +263,7 @@ public:
         size_t nRemoved{};
         auto & blk = *pblk;
         for (const auto &tx : blk.vtx) {
+            if (hasWitness && !*hasWitness && tx->HasWitness()) *hasWitness = true;
             if (auto it = fakeMempool.find(tx->GetHashRef());
                     it != fakeMempool.end() && (it->second.net == net || it->second.net == Net::AnyNet)) {
                 fakeMempool.erase(it);
@@ -383,7 +384,7 @@ class Connection : public std::enable_shared_from_this<Connection>
     int protoVersion = bitcoin::INIT_PROTO_VERSION;
     std::string cleanSubVer;
     bool sentVersion = false, sentVerAck = false, gotVersion = false, gotVerAck = false, didAfterHandshake = false, didVerifyCheckPoint = false;
-    bool relay = false;
+    bool relay = false, haveWitness = false;
     int misbehavior = 0;
     int startingHeight = -1; // remote starting height
     static constexpr int MAX_MISBEHAVIOR = 100;
@@ -501,6 +502,18 @@ class Connection : public std::enable_shared_from_this<Connection>
 
     const uint256 & GetCheckpointHash() const { return params.mostRecentCheckpoint.second; }
 
+    bitcoin::ServiceFlags makeLocalServiceFlags() const {
+        uint64_t ret = bitcoin::NODE_NETWORK|bitcoin::NODE_BLOOM;
+        if (net == BtcMain || net == BtcTest3 || net == BtcTest4)
+            ret |= bitcoin::NODE_WITNESS; // enable witness for BTC
+        else
+            ret |= bitcoin::NODE_BITCOIN_CASH; // BCH
+        return static_cast<bitcoin::ServiceFlags>(ret);
+    }
+
+    int makeTxOrBlockExtraFlags() const { return haveWitness ? bitcoin::SERIALIZE_TRANSACTION_USE_WITNESS : 0; }
+    bool wantWitness() const { return local.nServices & bitcoin::NODE_WITNESS; }
+
 protected:
     friend ConnMgr;
     Connection(ConnMgr *mgr, tcp::socket &&sock_, bool inbound_, Net net_, std::string_view infoName_)
@@ -521,8 +534,7 @@ protected:
             }
         };
         srv = ep2srv(sock.local_endpoint());
-        local = bitcoin::CAddress(srv, bitcoin::ServiceFlags(bitcoin::NODE_BITCOIN_CASH|bitcoin::NODE_NETWORK|bitcoin::NODE_BLOOM),
-                                  bitcoin::GetTime());
+        local = bitcoin::CAddress(srv, makeLocalServiceFlags(), bitcoin::GetTime());
         srv = ep2srv(sock.remote_endpoint());
         remote = bitcoin::CAddress(srv, bitcoin::ServiceFlags::NODE_NONE, bitcoin::GetTime());
         if (infoName.empty()) infoName = remote.ToStringIP();
@@ -816,6 +828,7 @@ async<> Connection::HandleVersion(bitcoin::CSerializedNetMsg && msg)
     vRecv >> nVersion >> nServiceInt >> nTime >> addrMe;
     this->protoVersion = nSendVersion = std::min(nVersion, PROTOCOL_VERSION);
     this->remote.nServices = ServiceFlags(nServiceInt);
+    this->haveWitness = nServiceInt & NODE_WITNESS;
 
     if (nVersion < MIN_PEER_PROTO_VERSION) {
         // disconnect from peers older than this proto version
@@ -986,9 +999,13 @@ async<> Connection::HandleInvs(bitcoin::CSerializedNetMsg && msg)
         co_return;
     }
 
+    // this is true if BTC and we want segwit but the peer lacks it as a service
+    const bool segwitNeededButMissingFromPeer = wantWitness() && !haveWitness;
+
     // handle normal INV
     std::vector<CInv> wantInvs;
-    wantInvs.reserve(invs.size());
+    if (!segwitNeededButMissingFromPeer)
+        wantInvs.reserve(invs.size());
 
     // first, register all invs seen as "peer has inv"
     for (const auto & inv : invs)
@@ -998,11 +1015,17 @@ async<> Connection::HandleInvs(bitcoin::CSerializedNetMsg && msg)
         LOCK_SHARED(mgr->mut);
         for (auto & inv : invs) {
             if (inv.IsTx() || inv.GetKind() == MSG_BLOCK) {
-                if (!mgr->haveInv_nolock(inv.hash) && !requestedInvs.contains(inv.hash)) {
+                if (!segwitNeededButMissingFromPeer && !mgr->haveInv_nolock(inv.hash) && !requestedInvs.contains(inv.hash)) {
                     wantInvs.push_back(std::move(inv));
-                    Debug("{}: Got new inv: {}", GetInfoStr(), wantInvs.back().ToString());
+                    auto &wanted = wantInvs.back();
+                    Debug("{}: Got new inv: {}", GetInfoStr(), wanted.ToString());
+                    if (haveWitness) {
+                        // BTC support: ensure they send us witness data for tx and block data
+                        wanted.type |= MSG_WITNESS_FLAG;
+                    }
                 } else {
-                    Debug("{}: Ignoring inv: {}", GetInfoStr(), inv.ToString());
+                    Debug("{}: Ignoring inv: {}{}", GetInfoStr(), inv.ToString(),
+                          segwitNeededButMissingFromPeer ? " (peer lacks segwit)" : "");
                 }
             } else {
                 Debug("{}: Ignoring unknown inv: {}", GetInfoStr(), inv.ToString());
@@ -1024,10 +1047,15 @@ async<> Connection::HandleTx(bitcoin::CSerializedNetMsg && msg)
 {
     using namespace bitcoin;
     CTransactionRef tx;
-    MakeReader(msg) >> tx;
+    MakeReader(msg, makeTxOrBlockExtraFlags()) >> tx;
 
     double elapsedMSec;
     peerHasInvs.insert(tx->GetHashRef());
+    if (wantWitness() && !haveWitness) {
+        // this is true if BTC and we want segwit but the peer lacks it as a service
+        Misbehaving(1, fmt::format("Unrequested tx from non-segwit peer, ignoring tx {}", tx->GetHashRef().ToString()));
+        co_return;
+    }
     if (auto it = requestedInvs.find(tx->GetHashRef()); it == requestedInvs.end()) {
         Misbehaving(1, fmt::format("Unrequested tx {}", tx->GetHashRef().ToString()));
         co_return;
@@ -1036,9 +1064,9 @@ async<> Connection::HandleTx(bitcoin::CSerializedNetMsg && msg)
         requestedInvs.erase(it);
     }
     if (auto [inserted, poolsz] = mgr->AddTxnToFakeMempool(GetNet(), tx); inserted)
-        Debug("{}: Got TX reply in {:1.3f} msec. txid: {}, size: {}, version: {}, nins: {}, nouts: {}, poolsz: {}",
-              GetInfoStr(), elapsedMSec, tx->GetHashRef().ToString(), tx->GetTotalSize(), tx->nVersion,
-              tx->vin.size(), tx->vout.size(), poolsz);
+        Debug("{}: Got TX reply in {:1.3f} msec. txid: {}, size: {}, version: {}, nins: {}, nouts: {}, poolsz: {}{}",
+              GetInfoStr(), elapsedMSec, tx->GetHashRef().ToString(), tx->GetTotalSize(haveWitness), tx->nVersion,
+              tx->vin.size(), tx->vout.size(), poolsz, tx->HasWitness() ? " [segwit]" : "");
     else
         Debug("{}: Got TX reply in {:1.3f} msec. txid: {}; already have tx",
               GetInfoStr(), elapsedMSec, tx->GetHashRef().ToString());
@@ -1049,11 +1077,16 @@ async<> Connection::HandleBlock(bitcoin::CSerializedNetMsg && msg)
     using namespace bitcoin;
     auto pblk = std::make_shared<CBlock>();
     CBlock & blk = *pblk;
-    MakeReader(msg) >> blk;
+    MakeReader(msg, makeTxOrBlockExtraFlags()) >> blk;
     const auto hash = blk.GetHash();
 
     double elapsedMSec;
     peerHasInvs.insert(hash);
+    if (wantWitness() && !haveWitness) {
+        // this is true if BTC and we want segwit but the peer lacks it as a service
+        Misbehaving(1, fmt::format("Unrequested block from non-segwit peer, ignoring block {}", hash.ToString()));
+        co_return;
+    }
     if (auto it = requestedInvs.find(hash); it == requestedInvs.end()) {
         Misbehaving(1, fmt::format("Unrequested block {}", hash.ToString()));
         co_return;
@@ -1061,7 +1094,8 @@ async<> Connection::HandleBlock(bitcoin::CSerializedNetMsg && msg)
         elapsedMSec = (GetTimeMicros() - it->second) / 1e3;
         requestedInvs.erase(it);
     }
-    if (mgr->ProcessBlock(GetNet(), hash, pblk)) {
+    bool blkHasSegwit{};
+    if (mgr->ProcessBlock(GetNet(), hash, pblk, haveWitness ? &blkHasSegwit : nullptr)) {
         auto ins_n_outs = std::pair<size_t, size_t>(0U, 0U);
         ins_n_outs = std::accumulate(blk.vtx.begin(), blk.vtx.end(), ins_n_outs,
                                      [](const auto &accum, const auto &tx){
@@ -1070,9 +1104,10 @@ async<> Connection::HandleBlock(bitcoin::CSerializedNetMsg && msg)
                                      });
         const auto tp = std::chrono::system_clock::from_time_t(blk.GetBlockTime());
         auto timeStr = fmt::format("{:%Y-%m-%d %H:%M:%S}", tp);
-        Debug("{}: Got BLOCK reply in {:1.3f} msec. hash: {}, size: {}, time: {} ({}), prevBlk: {}, nTx: {}, nIns: {}, nOuts: {}",
-              GetInfoStr(), elapsedMSec, hash.ToString(), bitcoin::GetSerializeSize(blk), blk.GetBlockTime(), timeStr,
-              blk.hashPrevBlock.ToString(), blk.vtx.size(), ins_n_outs.first, ins_n_outs.second);
+        Debug("{}: Got BLOCK reply in {:1.3f} msec. hash: {}, size: {}, time: {} ({}), prevBlk: {}, nTx: {}, nIns: {}, nOuts: {}{}",
+              GetInfoStr(), elapsedMSec, hash.ToString(), bitcoin::GetSerializeSize(blk, makeTxOrBlockExtraFlags()),
+              blk.GetBlockTime(), timeStr, blk.hashPrevBlock.ToString(), blk.vtx.size(), ins_n_outs.first, ins_n_outs.second,
+              blkHasSegwit ? " [segwit]" : "");
     } else
         Debug("{}: Got BLOCK reply in {:1.3f} msec. hash: {}; already seen block",
               GetInfoStr(), elapsedMSec, hash.ToString());
@@ -1191,8 +1226,9 @@ async<> Connection::HandleGetData(bitcoin::CSerializedNetMsg && msg)
                     Debug("{}: Sending tx {}{} ({} bytes) ...", GetInfoStr(),
                           styled(tx->GetHashRef().ToString(), fg(Color::green)|fmt::emphasis::italic),
                           !isSpam ? std::string{} : fmt::format(" {}", styled("spam", fg(Color::white)|bg(Color::magenta))),
-                          styled(tx->GetTotalSize(), fg(Color::bright_yellow)|fmt::emphasis::bold));
-                co_await Send(NetMsgType::TX, *tx);
+                          styled(tx->GetTotalSize(inv.IsWitness()), fg(Color::bright_yellow)|fmt::emphasis::bold));
+                const int modifiedVersion = protoVersion | (inv.IsWitness() ? SERIALIZE_TRANSACTION_USE_WITNESS : 0);
+                co_await Send(modifiedVersion, NetMsgType::TX, *tx);
                 if (pctr) pctr->fetch_add(1);
                 peerHasInvs.insert(tx->GetHashRef());
             }

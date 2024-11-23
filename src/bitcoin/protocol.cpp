@@ -187,6 +187,7 @@ void SetServiceFlagsIBDCache(bool state) {
 
 std::string CInv::GetCommand() const {
     std::string cmd;
+    if (type & MSG_WITNESS_FLAG) cmd.append("witness-"); // BTC support
     switch (GetKind()) {
         case MSG_TX:
             return cmd.append(NetMsgType::TX);

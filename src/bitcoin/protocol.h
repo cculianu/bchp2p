@@ -309,6 +309,8 @@ enum ServiceFlags : uint64_t {
     // advertising this bit, but no longer do as of protocol version 70011 (=
     // NO_BLOOM_VERSION)
     NODE_BLOOM = (1 << 2),
+    // Used by BTC to indicate it can see segwit
+    NODE_WITNESS = (1 << 3),
     // NODE_XTHIN means the node supports Xtreme Thinblocks. If this is turned
     // off then the node will not service nor make xthin requests.
     NODE_XTHIN = (1 << 4),
@@ -442,7 +444,8 @@ public:
 };
 
 /** getdata message type flags */
-const uint32_t MSG_TYPE_MASK = 0xffffffff >> 3;
+inline constexpr uint32_t MSG_TYPE_MASK = 0xffffffff >> 3;
+inline constexpr uint32_t MSG_WITNESS_FLAG = 1 << 30; // for BTC SegWit
 
 /** getdata / inv message types.
  * These numbers are defined by the protocol. When adding a new value, be sure
@@ -458,7 +461,7 @@ enum GetDataMsg {
     //! Defined in BIP152
     MSG_CMPCT_BLOCK = 4,
     //! Double spend proof
-    MSG_DOUBLESPENDPROOF = 0x94a0
+    MSG_DOUBLESPENDPROOF = 0x94a0,
 };
 
 /**
@@ -489,9 +492,10 @@ public:
 
     bool IsSomeBlock() const {
         auto k = GetKind();
-        return k == MSG_BLOCK || k == MSG_FILTERED_BLOCK ||
-               k == MSG_CMPCT_BLOCK;
+        return k == MSG_BLOCK || k == MSG_FILTERED_BLOCK || k == MSG_CMPCT_BLOCK;
     }
+
+    bool IsWitness() const { return type & MSG_WITNESS_FLAG; }
 
     uint32_t type;
     uint256 hash;
