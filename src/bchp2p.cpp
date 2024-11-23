@@ -100,6 +100,10 @@ struct ChainParams
     std::pair<uint32_t, uint256> mostRecentCheckpoint;
 };
 
+// This minimal bloom filter matches everything you throw at it. We use it to "trick" BTC nodes into accepting
+// "mempool" messages from us -- and dumping their entire mempool to us. (Requires peer advertises NODE_BLOOM however).
+const std::array<uint8_t, 11> bloomFilterMatchAllRawSer = {0x1, 0xff, 0x1, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0};
+
 enum Net : uint8_t { Main = 0, Chip, Test3, Test4, Scale, Reg, BtcMain, BtcTest3, BtcTest4,
                      NumNets, AnyNet = 0xffu /* special value! */ };
 
@@ -894,8 +898,20 @@ async<> Connection::DoOnceIfAfterHandshake() {
             co_await Send(NetMsgType::SENDCMPCT, fAnnounceUsingCMPCTBLOCK, nCMPCTBLOCKVersion); // testing!
         }
         if (const auto invs2Spam = mgr->GetInvsToSpam(); invs2Spam.empty()) {
-            if (!cleanSubVer.starts_with("/Satoshi:")) // Core nodes reject us if we send MEMPOOL without a bloom filter set
+            bool dontSendMempool = false;
+            if (cleanSubVer.starts_with("/Satoshi:")) {
+                if (remote.nServices & bitcoin::NODE_BLOOM) {
+                    // Core nodes reject us if we send MEMPOOL without a bloom filter set
+                    co_await Send(NetMsgType::FILTERLOAD, bloomFilterMatchAllRawSer);
+                } else {
+                    dontSendMempool = true;
+                    Warning("{}: Cannot send MEMPOOL message to BTC peer because it lacks NODE_BLOOM"
+                            " (it would drop us if we sent MEMPOOL without a filter loaded)", GetInfoStr());
+                }
+            }
+            if (!dontSendMempool)
                 co_await Send(NetMsgType::MEMPOOL); // testing!
+
             /* testing that Core disclosure bug...
             std::vector<CInv> invs;
             invs.reserve(MAX_INV_SZ); // 50,000
@@ -1746,7 +1762,6 @@ int main(int argc, const char *argv[]) {
     bitcoin::RandomInit();
     if (!bitcoin::Random_SanityCheck()) fmt::print(stderr, "{}", styled("WARNING: Random_SanityCheck failed!", fg(fmt::terminal_color::bright_yellow) | fmt::emphasis::bold));
     Log("Using SHA256: {}", styled(bitcoin::SHA256AutoDetect(), fg(fmt::terminal_color::white)|bg(fmt::terminal_color::blue)|fmt::emphasis::bold));
-
     try {
         ConnMgr mgr(std::move(txnsToSpam));
         asio::io_context & io_context = *mgr.io_context;
