@@ -395,6 +395,7 @@ class Connection : public std::enable_shared_from_this<Connection>
     int startingHeight = -1; // remote starting height
     static constexpr int MAX_MISBEHAVIOR = 100;
     bitcoin::Amount feeFilter;
+    std::unique_ptr<bitcoin::CBloomFilter> bloomFilter;
 
     std::unordered_map<uint256, int64_t, bitcoin::SaltedUint256Hasher> requestedInvs;
     std::deque<bitcoin::CInv> invQ;
@@ -432,6 +433,9 @@ class Connection : public std::enable_shared_from_this<Connection>
     [[nodiscard]] async<> HandleReject(bitcoin::CSerializedNetMsg && msg);
     [[nodiscard]] async<> HandleGetData(bitcoin::CSerializedNetMsg && msg);
     [[nodiscard]] async<> HandleWtxidRelay(bitcoin::CSerializedNetMsg && msg);
+    [[nodiscard]] async<> HandleFilterLoad(bitcoin::CSerializedNetMsg && msg);
+    [[nodiscard]] async<> HandleFilterAdd(bitcoin::CSerializedNetMsg && msg);
+    [[nodiscard]] async<> HandleFilterClear(bitcoin::CSerializedNetMsg && msg);
 
     [[nodiscard]] async<> DoOnceIfAfterHandshake(); // does GETADDR, etc -- stuff we do immediately after a state change to "fully established"
     [[nodiscard]] async<> InvSender();
@@ -575,9 +579,9 @@ public:
 std::shared_ptr<Connection> ConnMgr::CreateConnection(tcp::socket &&sock, bool inbound, Net net, std::string_view infoName = {})
 {
     Connection *conn = new Connection(this, std::move(sock), inbound, net, infoName);
-    Defer d([&conn] { if (conn) { delete conn; conn = nullptr; } }); // ensure `conn` doesn't leak on exception
+    Defer d([conn]{ delete conn; }); // ensure `conn` doesn't leak on exception
     std::shared_ptr<Connection> ret(conn, [this](Connection *c) { rm(c->GetId()); delete c; });
-    conn = nullptr;
+    d.disable();
     add(ret);
     return ret;
 }
@@ -611,8 +615,12 @@ ConnMgr::AddTxnToFakeMempool_nolock(Net net, const CTransactionRef &tx, bool pus
         if (pushInvs) {
             for (const auto & [id, wptr] : conns) {
                 auto conn = wptr.lock();
-                if (!conn || (net != Net::AnyNet && conn->GetNet() != net) || conn->peerHasInvs.contains(tx->GetHashRef())) continue;
-                conn->PushInv(bitcoin::MSG_TX, tx->GetHashRef());
+                if (conn && (net == Net::AnyNet || conn->GetNet() == net)
+                    && !conn->peerHasInvs.contains(tx->GetHashRef())
+                    && (!conn->bloomFilter || conn->bloomFilter->IsRelevantAndUpdate(*tx))) {
+                    // Conn is valid, matches net, peer doesn't have, matches bloom filter (if any), so push
+                    conn->PushInv(bitcoin::MSG_TX, tx->GetHashRef());
+                }
             }
         }
     }
@@ -808,6 +816,21 @@ async<> Connection::MsgHandler(bitcoin::CSerializedNetMsg && msg)
 
         if (ncmd == NetMsgType::WTXIDRELAY) {
             co_return co_await HandleWtxidRelay(std::move(msg));
+        }
+
+        if (NetMsgType::BloomFilterSubCmd subcmd; NetMsgType::IsBloomFilterLike(ncmd, &subcmd)) {
+            if (local.nServices & NODE_BLOOM) {
+                using enum NetMsgType::BloomFilterSubCmd;
+                switch(subcmd) {
+                case Load: co_await HandleFilterLoad(std::move(msg)); break;
+                case Add: co_await HandleFilterAdd(std::move(msg)); break;
+                case Clear: co_await HandleFilterClear(std::move(msg)); break;
+                case Invalid: Error("{}: Impossible filter subcommand 'Invalid' encountered! FIXME!", GetInfoStr()); break;
+                }
+            } else {
+                Misbehaving(1, fmt::format("{} received despite not offering bloom service", ncmd));
+            }
+            co_return;
         }
 
     } catch (const std::ios_base::failure &e) {
@@ -1277,6 +1300,44 @@ async<> Connection::HandleWtxidRelay(bitcoin::CSerializedNetMsg && msg)
     if (!IsNetBtc(net))
         Warning("{}: Got WTXIDRELAY message from a non-BTC net peer", GetInfoStr());
     Debug("{}: Ignoring unsupported WTXIDRELAY message", GetInfoStr());
+    co_return;
+}
+
+async<> Connection::HandleFilterLoad(bitcoin::CSerializedNetMsg && msg)
+{
+    using namespace bitcoin;
+    CBloomFilter filter;
+    MakeReader(msg) >> filter;
+    if (!filter.IsWithinSizeConstraints()) {
+        Misbehaving(1, "too-large bloom filter");
+    } else {
+        bloomFilter = std::make_unique<CBloomFilter>(std::move(filter));
+        bloomFilter->UpdateEmptyFull();
+        Log("{}: Loaded bloom filter for peer (size: {} bytes)", GetInfoStr(), bloomFilter->GetDataSize());
+    }
+    co_return;
+}
+
+async<> Connection::HandleFilterAdd(bitcoin::CSerializedNetMsg && msg)
+{
+    using namespace bitcoin;
+    std::vector<uint8_t> dataBlob;
+    MakeReader(msg) >> dataBlob;
+    // Nodes must NEVER send a data item > MAX_SCRIPT_ELEMENT_SIZE bytes (the max size for a script data object,
+    // and thus, the maximum size any matched object can have) in a filteradd message
+    if (dataBlob.size() > MAX_SCRIPT_ELEMENT_SIZE || !bloomFilter) {
+        Misbehaving(1, "bad filteradd message");
+    } else {
+        bloomFilter->insert(dataBlob);
+        Debug("{}: inserted {}-byte item into bloom filter for peer", GetInfoStr(), dataBlob.size());
+    }
+    co_return;
+}
+
+async<> Connection::HandleFilterClear(bitcoin::CSerializedNetMsg && msg)
+{
+    bloomFilter.reset();
+    Debug("{}: bloom filter disabled", GetInfoStr());
     co_return;
 }
 

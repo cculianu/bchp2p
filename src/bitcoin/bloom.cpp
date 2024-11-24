@@ -50,12 +50,12 @@ CBloomFilter::Hash(uint32_t nHashNum,
                    const std::vector<uint8_t> &vDataToHash) const {
     // 0xFBA4C795 chosen as it guarantees a reasonable bit difference between
     // nHashNum values.
-    return MurmurHash3(nHashNum * 0xFBA4C795 + nTweak, vDataToHash) %
-           (vData.size() * 8);
+    return MurmurHash3(nHashNum * 0xFBA4C795 + nTweak, vDataToHash)
+           % (std::max<size_t>(vData.size(), 1u) * 8);
 }
 
 void CBloomFilter::insert(const std::vector<uint8_t> &vKey) {
-    if (isFull) {
+    if (isFull || vData.empty()) {
         return;
     }
 
@@ -80,7 +80,7 @@ void CBloomFilter::insert(const uint256 &hash) {
 }
 
 bool CBloomFilter::contains(const std::vector<uint8_t> &vKey) const {
-    if (isFull) {
+    if (isFull || vData.empty()) {
         return true;
     }
     if (isEmpty) {
@@ -110,7 +110,7 @@ bool CBloomFilter::contains(const uint256 &hash) const {
 
 void CBloomFilter::clear() {
     vData.assign(vData.size(), 0);
-    isFull = false;
+    isFull = vData.empty();
     isEmpty = true;
 }
 

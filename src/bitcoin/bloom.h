@@ -109,6 +109,9 @@ public:
 
     //! Checks for empty and full filters to avoid wasting cpu
     void UpdateEmptyFull();
+
+    // Added by Calin
+    size_t GetDataSize() const { return vData.size(); }
 };
 
 /**

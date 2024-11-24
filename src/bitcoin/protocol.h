@@ -288,6 +288,10 @@ extern const std::string_view WTXIDRELAY;
  */
 bool IsBlockLike(std::string_view msg_type);
 
+enum class BloomFilterSubCmd { Invalid = 0, Load, Add, Clear };
+// Added by Calin -- matches: FILTERLOAD, FILTERADD, FILTERCLEAR, and returns true in that case, false otherwise.
+bool IsBloomFilterLike(std::string_view msg_type, BloomFilterSubCmd *matched = nullptr);
+
 // Returns either an instance of one of the above, or "Unknown"sv if the message is not known.
 std::string_view Normalize(std::string_view msg_type);
 }; // namespace NetMsgType

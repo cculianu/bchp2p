@@ -70,6 +70,17 @@ std::string_view Normalize(std::string_view msg_type) {
         if (mt == msg_type) return mt; // assumption is `mt` outlives everything in this program
     return "Unknown"sv;
 }
+bool IsBloomFilterLike(std::string_view msg_type, BloomFilterSubCmd *matched) {
+    BloomFilterSubCmd sub = BloomFilterSubCmd::Invalid;
+    if (msg_type.starts_with("filter"sv)) {
+        auto s = msg_type.substr(6);
+        if (s == "load"sv) sub = BloomFilterSubCmd::Load;
+        else if (s == "add"sv) sub = BloomFilterSubCmd::Add;
+        else if (s == "clear"sv) sub = BloomFilterSubCmd::Clear;
+    }
+    if (matched) *matched = sub;
+    return sub != BloomFilterSubCmd::Invalid;
+}
 }; // namespace NetMsgType
 
 /**
